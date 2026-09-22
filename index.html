@@ -1760,8 +1760,8 @@ const KINDS={live:{label:'Live',color:'var(--green)',emoji:''},gemist:{label:'Ge
 function isLive(t){return !t.kind||t.kind==='live';}
 
 /* ═══ Persistentie (localStorage) ═══ */
-const APP_VERSION='v0.9.115';
-const SCHEMA_VERSION=6;
+const APP_VERSION='v0.9.117';
+const SCHEMA_VERSION=7;
 const DB={
   // Type-bewust: valt terug op de default als opslag ontbreekt, corrupt is, of van een
   // ander type dan verwacht (bv. sj_manual='null' of een array waar een object hoort).
@@ -1822,6 +1822,12 @@ const IDB={db:null,
 /* Geversioneerde schema-migratie: elke toekomstige breaking change krijgt een {v, up}-stap.
    up() transformeert de al-geladen live-staat (T, PBOOK, tagConfig, …) in-place.
    runMigrations() draait in boot() ná de data-load, maakt eerst een snapshot en rolt terug bij fouten. */
+/* Wat de opruimstappen hebben samengevoegd. De oude journal maakte van één positie die in
+   stappen sloot meerdere rijen, elk met de cumülatieve P&L - dus telde hij die positie
+   meerdere keren. Bij het overzetten willen we dat verschil kunnen uitleggen in plaats van
+   het als integriteitsfout te melden. */
+const MIG_SAMEN={n:0,pnl:0};
+const migSamen=t=>{MIG_SAMEN.n++;MIG_SAMEN.pnl+=(+t.pnl||0);};
 const MIGRATIONS=[
   // v2 (2026-09-14): open-moment wordt de canonieke trade-datum/tijd/sessie voor gesyncte
   // trades. Adapters stempelden dit wisselend (MEXC/Blofin op sluitmoment, HL op open),
@@ -1863,7 +1869,7 @@ const MIGRATIONS=[
       if(lijst.length<2)return;
       // de laatste stand bevat de eerdere al; die houden we
       const houden=lijst.reduce((a,b)=>((+b.closeTime||0)>=(+a.closeTime||0)?b:a));
-      lijst.forEach(t=>{ if(t!==houden){ adoptUserFieldsSJ(houden,t); weg.add(t.id); } });
+      lijst.forEach(t=>{ if(t!==houden){ adoptUserFieldsSJ(houden,t); migSamen(t); weg.add(t.id); } });
     });
     if(weg.size)T=T.filter(t=>!weg.has(t.id));
   }},
@@ -1901,8 +1907,29 @@ const MIGRATIONS=[
     });
     if(n&&isFinite(vroegste)&&CONNS.hyperliquid&&CONNS.hyperliquid.connected){ CONNS.hyperliquid={...CONNS.hyperliquid,lastSync:vroegste-3600e3}; persistConns(); }
   }},
+  /* Blofin van "rij per sluiting" naar "rij per positie-levensloop". Oude rijen heten
+     blofin_<positionId>_<updateTime>; alle tussenstanden van één levensloop delen positionId
+     én openTime (= createTime). Per groep blijft de laatste stand staan (die bevat de rest al),
+     onder de nieuwe sleutel positionId + createTime; notities en tags van de weggevallen rijen
+     verhuizen mee. Fills gaan leeg, de sync gaat terug tot de oudste rij. Rijen uit de
+     orderhistorie (blofin_<orderId>) en CSV-imports blijven zoals ze zijn. */
+  {v:7,note:'Blofin: sleutel per positie-levensloop',up(){
+    const groep=new Map();let vroegste=Infinity;
+    const sleutel=t=>{const m=/^blofin_(\d+)_(\d+)$/.exec(String((t&&t.srcId)||''));if(!m||!(+t.openTime>0))return null;return 'blofin_'+m[1]+'_'+(+t.openTime);};
+    T.forEach(t=>{ if(!t||t.exchange!=='blofin'||t.status!=='closed')return; const k=sleutel(t); if(!k)return; (groep.get(k)||groep.set(k,[]).get(k)).push(t); });
+    const weg=new Set();
+    groep.forEach((lijst,k)=>{
+      const houden=lijst.reduce((a,b)=>((+b.closeTime||0)>=(+a.closeTime||0)?b:a));
+      lijst.forEach(t=>{ if(t!==houden){ adoptUserFieldsSJ(houden,t); migSamen(t); weg.add(t.id); } });
+      houden.srcId=k; houden.fills=[]; vroegste=Math.min(vroegste,+houden.openTime||Infinity);
+    });
+    if(weg.size)T=T.filter(t=>!weg.has(t.id));
+    let prul=0;TRASH.forEach(t=>{ const k=t&&t.exchange==='blofin'?sleutel(t):null; if(k){t.srcId=k;prul++;} });if(prul)persistTrash();
+    if(groep.size&&isFinite(vroegste)&&CONNS.blofin&&CONNS.blofin.connected){ CONNS.blofin={...CONNS.blofin,lastSync:vroegste-3600e3}; persistConns(); }
+  }},
 ];
 async function runMigrations(){
+  MIG_SAMEN.n=0;MIG_SAMEN.pnl=0;
   const from=DB.load('schema',0);
   if(from>=SCHEMA_VERSION){return {ran:0};}
   const pending=MIGRATIONS.filter(m=>m.v>from && m.v<=SCHEMA_VERSION).sort((a,b)=>a.v-b.v);
@@ -4688,7 +4715,8 @@ function applyBackup(d){
      dus zetten we de teller terug op de versie van het bestand en laten de stappen er
      alsnog overheen lopen. Zonder dit blijft oude rommel uit de back-up gewoon staan. */
   const bv=+d.schemaVersion||0;
-  if(bv&&bv<SCHEMA_VERSION){ try{DB.save('schema',bv);runMigrations().then(()=>render());}catch(e){} }
+  if(bv&&bv<SCHEMA_VERSION){ try{DB.save('schema',bv);return runMigrations().then(()=>render());}catch(e){} }
+  return Promise.resolve();
 }
 /* ═══ Backup-bewaking (hosting-plan fase 1, Denny 2026-09-16) ═══
    Eén statuslaag voor álle backup-methodes: elke geslaagde backup (handmatige export,
@@ -5092,7 +5120,12 @@ const TJMigrate={
     });
     const pbById={};(old.playbooks||[]).forEach(pb=>{if(pb&&pb.id&&pb.name)pbById[pb.id]=pb.name;});
     let compl=0;
-    const trades=(old.trades||[]).map((ot,i)=>{ const t={...migrateOldTrade(ot),id:i}; const src=ot.source;
+    /* Een oude opslag kan beschadigd zijn (lege regels, half opgeslagen JSON). Zulke
+       regels overslaan in plaats van het hele overzetten laten vallen. */
+    const bruikbaar=(old.trades||[]).filter(ot=>ot&&typeof ot==='object');
+    const kapot=(old.trades||[]).length-bruikbaar.length;
+    if(kapot)warnings.push(kapot+' regel'+(kapot===1?'':'s')+' uit je oude journal was onleesbaar en '+(kapot===1?'is':'zijn')+' niet overgezet.');
+    const trades=bruikbaar.map((ot,i)=>{ const t={...migrateOldTrade(ot),id:i}; const src=ot.source;
       if(src&&src!=='manual'){ const a=acctById[src];
         if(a)t.exchange=(!a.type||a.type==='manual')?a.id:(EXMAP[a.type]?a.type:'');
         else if(EXMAP[src])t.exchange=src; else if(OLD_EXMAP[src])t.exchange=OLD_EXMAP[src]; else t.exchange='';
@@ -5112,19 +5145,25 @@ const TJMigrate={
     const theme=TJ_THEME[(old.config||{}).theme]||'light';
     const settings={theme,currency:'USD',priv:!!old.privacy,density:STATE.density};
     const report={trades:trades.length,playbooks:Object.keys(pbook).length,manual:manual.length,conns:Object.keys(conns).length,tags:['setupTags','confirmationTags','timeframeTags','emotionTags','mistakeTags'].reduce((s,c)=>s+(((old.tags&&old.tags[c])||[]).length),0),pnl:trades.reduce((s,t)=>s+(+t.pnl||0),0)};
-    return {payload:{trades,tagConfig:tagConfigOut,pbook,manual,conns,exMeta,settings},report,warnings,old};
+    /* schemaVersion 1: de oude journal kent ons schema niet, en zonder dit veld sloeg
+       applyBackup de opruimstappen over. Juist die stappen trekken de oude rij-per-sluiting
+       gelijk (Blofin v7, OKX v3/v5, Hyperliquid v6) en zetten de datum op het open-moment (v2). */
+    return {payload:{schemaVersion:1,trades,tagConfig:tagConfigOut,pbook,manual,conns,exMeta,settings},report,warnings,old};
   },
   // Integriteit ná het overzetten: aantallen, geldige velden, én de totale P&L moet
   // op de cent kloppen met de oude data (fase-3-audit, Denny 2026-09-17).
   verify(payload,old){ const issues=[];
-    if(!Array.isArray(T)||T.length!==payload.trades.length)issues.push('Aantal trades komt niet overeen na overzetten.');
+    const samen=MIG_SAMEN.n;   // bewust samengevoegd door de opruimstappen, geen verlies
+    if(!Array.isArray(T)||T.length!==payload.trades.length-samen)issues.push('Aantal trades komt niet overeen na overzetten.');
     if((T||[]).some(t=>t&&(t.pnl===undefined||isNaN(+t.pnl))))issues.push('Sommige trades hebben een ongeldige P&L.');
     if((T||[]).some(t=>!t||!t.date))issues.push('Sommige trades missen een datum.');
     if(old&&Array.isArray(old.trades)){
-      const sumOld=old.trades.reduce((s,t)=>s+(+t.pnl||0),0),sumNew=(T||[]).reduce((s,t)=>s+(+t.pnl||0),0);
-      if(Math.abs(sumOld-sumNew)>0.01)issues.push('Totale P&L wijkt af: oud '+eurS(sumOld)+' vs overgezet '+eurS(sumNew)+'.');
-      const clOld=old.trades.filter(t=>(t.status||'closed')==='closed').length,clNew=(T||[]).filter(t=>t.status==='closed').length;
-      if(clOld!==clNew)issues.push('Aantal gesloten trades wijkt af ('+clOld+' → '+clNew+').');
+      const oudeRijen=old.trades.filter(t=>t&&typeof t==='object');   // onleesbare regels tellen niet mee
+      const sumOld=oudeRijen.reduce((s,t)=>s+(+t.pnl||0),0),sumNew=(T||[]).reduce((s,t)=>s+(+t.pnl||0),0);
+      const verwacht=sumOld-MIG_SAMEN.pnl;   // de dubbeltellingen van de oude journal vallen weg
+      if(Math.abs(verwacht-sumNew)>0.01)issues.push('Totale P&L wijkt af: verwacht '+eurS(verwacht)+' vs overgezet '+eurS(sumNew)+'.');
+      const clOld=oudeRijen.filter(t=>(t.status||'closed')==='closed').length,clNew=(T||[]).filter(t=>t.status==='closed').length;
+      if(clOld-samen!==clNew)issues.push('Aantal gesloten trades wijkt af ('+clOld+' → '+clNew+').');
     }
     return issues; },
   // Oud EXPORT-bestand (volledige backup: trades+tagConfig+accounts+config+playbooks,
@@ -5169,10 +5208,12 @@ async function migApply(){
   const pre=_migPre;if(!pre)return;_migPre=null;closeForm();
   try{
     await Snapshots.create(pre.source==='file'?'vóór import oude backup':'vóór migratie');
-    applyBackup(pre.payload);
+    await applyBackup(pre.payload);   // de opruimstappen horen klaar te zijn vóór de controle
     const issues=TJMigrate.verify(pre.payload,pre.old);
+    const warnings=[...pre.warnings];
+    if(MIG_SAMEN.n)warnings.push(MIG_SAMEN.n+' rij'+(MIG_SAMEN.n===1?'':'en')+' bleken tussenstanden van een positie die in stappen sloot. De oude journal telde die apart mee; ze zijn samengevoegd tot hun positie, met je notities en labels erbij.');
     DB.save('migrated_from_tj',{when:new Date().toISOString(),trades:pre.report.trades,source:pre.source});
-    showMigrationReport(pre.report,pre.warnings,issues);
+    showMigrationReport({...pre.report,trades:(T||[]).length},warnings,issues);
   }catch(e){ ErrorCenter.report('migrate',e,{severity:'error',userMsg:'De migratie is mislukt. Je bestaande data is ongewijzigd, probeer opnieuw of importeer een JSON-back-up.'}); }
 }
 function openModalHTML(html){ const m=document.getElementById('modal'); m.innerHTML=html; m.classList.add('on'); document.getElementById('scrim').classList.add('on'); modalKind='wizard';formDirty=false; }
@@ -5634,7 +5675,12 @@ const ExchangeAPI = {
         // Warm up contractValue cache vóór mapping
         await this._getContractValue("BTC-USDT");
         const ctvMap=this._ctvCache||{};
-        // Elk close-record = 1 trade (géén aggregatie). Size = closePositions (qty gesloten in DIT event).
+        /* Één positie-levensloop = één trade (model B, 22-09-2026). Blofin hergebruikt positionId
+           per instrument (snapshot 04-05: 33 levenslopen onder één id); createTime is per
+           levensloop uniek en het record werkt in-place bij naarmate er meer sluit. Met
+           updateTime in de sleutel werd elke tussenstand een eigen rij (de "siblings" van de
+           partial-detectie); met alleen positionId zou elke heropening de vorige overschrijven.
+           Size = closePositions: wat er tot nu toe van deze levensloop gesloten is. */
         return(data.trades||[]).filter(t=>{const pnl=parseFloat(t.realizedPnl||t.pnl||"0");const sz=Math.abs(parseFloat(t.closePositions||t.closeTotalPos||"0"));return pnl!==0||sz>0}).map(t=>{
           const posSide=(t.positionSide||"net").toLowerCase();
           const closeTime=t.updateTime||t.createTime||Date.now();
@@ -5679,7 +5725,7 @@ const ExchangeAPI = {
             const grossPn=netPn+feePn; // assume realizedPnl is NET
             direction=((xN-entryN)*grossPn>=0)?"long":"short";
           }
-          return{id:"blofin_"+t.positionId+"_"+closeTime,date:ts2date(closeTime),time:ts2time(closeTime),pair:(t.instId||"").replace("-","/"),direction,entry:normPrice(entryPrice),exit:normPrice(exitPrice),positionSize:sizeUsdt||normPrice(assetQty),positionSizeAsset:assetQty>0?normPrice(assetQty):"",pnl:t.realizedPnl||t.pnl||"",fees:t.fee?Math.abs(parseFloat(t.fee)).toString():"0",leverage:t.leverage||"10",source:"blofin",status:"closed",stopLoss:"",takeProfit:"",highestPrice:"",lowestPrice:"",setupTags:[],confirmationTags:[],timeframeTags:[],emotionTags:[],mistakeTags:[],customTags:[],rating:0,screenshot:null,notes:"",links:[],layers:[],positionId:t.positionId||"",openTime:t.createTime||"",closeTime:String(closeTime),
+          return{id:"blofin_"+t.positionId+"_"+(t.createTime||closeTime),date:ts2date(closeTime),time:ts2time(closeTime),pair:(t.instId||"").replace("-","/"),direction,entry:normPrice(entryPrice),exit:normPrice(exitPrice),positionSize:sizeUsdt||normPrice(assetQty),positionSizeAsset:assetQty>0?normPrice(assetQty):"",pnl:t.realizedPnl||t.pnl||"",fees:t.fee?Math.abs(parseFloat(t.fee)).toString():"0",leverage:t.leverage||"10",source:"blofin",status:"closed",stopLoss:"",takeProfit:"",highestPrice:"",lowestPrice:"",setupTags:[],confirmationTags:[],timeframeTags:[],emotionTags:[],mistakeTags:[],customTags:[],rating:0,screenshot:null,notes:"",links:[],layers:[],positionId:t.positionId||"",openTime:t.createTime||"",closeTime:String(closeTime),
             // v12.62: raw close-size in base currency (Blofin geeft closePositions in BTC voor BTC-USDT, niet in contracts).
             // Gebruikt door detectPartialFromSiblings voor correcte pct-berekening op tpLevels — anders krijg je 0.05% i.p.v. 34%.
             // v12.90: sla _rawCloseSize op als BASE currency (= assetQty na heuristic), niet
@@ -5767,7 +5813,33 @@ const ExchangeAPI = {
       if(startTime)params.begin=startTime;
       if(endTime)params.end=endTime;
       const data=await this._direct(apiKey,apiSecret,passphrase,"/api/v1/trade/fills-history",params);
-      return{fills:data.data||[],total:(data.data||[]).length};
+      return Array.isArray(data&&data.data)?data.data:[];
+    },
+    /* Blofin-fills → de stappen van één levensloop. Geen positionId op fills, dus koppelen op
+       instrument + positiekant + het tijdvenster van de levensloop; in net-mode is positionSide
+       "net" en beslist de lopende teller. fillPnl is Blofin's eigen P&L per fill en is leidend. */
+    stepsForTrade(t,raw){
+      const dir=String(t.dir||t.direction||"").toLowerCase();
+      const basis=String(t.pair||"").split("/")[0].toUpperCase();
+      const van=(+t.openTime||0)-1000, tot=(+t.closeTime||Date.now())+1000;
+      const eerste=(f,...ks)=>{for(const k of ks){const v=f[k];if(v!==undefined&&v!==null&&v!=='')return v;}return '';};
+      return (raw||[]).map(f=>({
+        id:eerste(f,'tradeId','fillId','id')||undefined,
+        ordId:String(eerste(f,'orderId','ordId')),
+        instId:String(eerste(f,'instId','instrument','symbol')),
+        posSide:String(eerste(f,'positionSide','posSide')).toLowerCase(),
+        ts:+eerste(f,'ts','fillTime','time')||0,
+        side:String(eerste(f,'side')).toLowerCase(),
+        qty:Math.abs(parseFloat(eerste(f,'fillSize','fillSz','size'))||0),
+        price:parseFloat(eerste(f,'fillPrice','fillPx','price'))||0,
+        fee:Math.abs(parseFloat(eerste(f,'fee'))||0),
+        pnlExch:(()=>{const v=parseFloat(f.fillPnl);return isFinite(v)&&v!==0?v:null;})(),
+      })).filter(f=>{
+        if(basis&&f.instId&&f.instId.split(/[-_/]/)[0].toUpperCase()!==basis)return false;
+        if(!(f.ts>=van&&f.ts<=tot))return false;
+        if(f.posSide==="long"||f.posSide==="short")return f.posSide===dir;
+        return true;
+      });
     }
   },
   kraken:{
@@ -6341,7 +6413,7 @@ ExchangeAPI.okx.captureSnapshot=async function(creds){
 // ─────────────────────────────────────────────────────────────────────────────
 // v12.232: optionele sourceKey-param — dispatcher geeft de werkelijke trade.source door
 // (account.id post-multi-account); zonder param valt 'ie terug op de legacy type-string.
-ExchangeAPI.blofin.detectPartials=function(trades,sourceKey){return detectPartialFromSiblings(trades,sourceKey||"blofin","blofin")};
+ExchangeAPI.blofin.detectPartials=function(trades){return trades};   // model B: één rij per levensloop, geen siblings
 ExchangeAPI.mexc.detectPartials=function(trades,sourceKey){return detectPartialFromSiblings(trades,sourceKey||"mexc","mexc")};
 ExchangeAPI.kraken.detectPartials=function(trades,sourceKey){return detectPartialFromSiblings(trades,sourceKey||"kraken","kraken")};
 ExchangeAPI.hyperliquid.detectPartials=function(trades){return trades};   // model B: een levensloop is al compleet, er zijn geen siblings
