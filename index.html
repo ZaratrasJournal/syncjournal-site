@@ -1762,7 +1762,7 @@ const KINDS={live:{label:'Live',color:'var(--green)',emoji:''},gemist:{label:'Ge
 function isLive(t){return !t.kind||t.kind==='live';}
 
 /* ═══ Persistentie (localStorage) ═══ */
-const APP_VERSION='v0.9.121';
+const APP_VERSION='v0.9.124';
 const SCHEMA_VERSION=7;
 const DB={
   // Type-bewust: valt terug op de default als opslag ontbreekt, corrupt is, of van een
@@ -2392,7 +2392,7 @@ function execLegs(fills){
 }
 const ts2dag=ms=>new Date(+ms||Date.now()).toLocaleDateString('nl-NL',{weekday:'short',day:'numeric',month:'short'});
 function execTable(t){
-  const f=stepsOf(t);
+  const f=stappenVan(t);
   if(f.length<2||!f.some(isAfbouw))return '';
   const sum=fillSummary(f);
   const legs=execLegs(f);
@@ -2449,7 +2449,9 @@ function execTable(t){
     : `<span>${sum.entries} ${sum.entries===1?'instap':'instappen'} \u00b7 ${sum.exits} ${sum.exits===1?'afbouw':'afbouwstappen'}</span>`
       +((sum.avgEntry&&sum.firstEntry&&Math.abs(sum.avgEntry-sum.firstEntry)>1e-9)
         ? ` <span>eerste instap <i>${px(sum.firstEntry)}</i> \u00b7 gemiddeld <i>${px(sum.avgEntry)}</i></span>` : '');
-  return `<div class="exwrap"><div class="exhead"><b>Zo is deze positie gelopen</b>${kop}</div>
+  const afgeleid=f.every(x=>x.synthetic)
+    ? ` <span style="color:var(--amber)" title="Deze stappen zijn afgeleid uit je entry, size, TP-niveaus en exit — ze komen niet van een exchange">≈ afgeleid uit je invoer</span>` : '';
+  return `<div class="exwrap"><div class="exhead"><b>Zo is deze positie gelopen</b>${kop}${afgeleid}</div>
     <table class="extab"><thead><tr><th>Tijd</th><th>Wat</th><th>Aantal</th><th>Prijs</th><th>Positie na</th><th>\u00d8 entry</th><th>Fee ${CURSYM()}</th><th>P&amp;L</th></tr></thead>
     <tbody>${rows}</tbody>
     <tfoot><tr><td></td><td><b>Samen</b></td><td class="num mask">${n(sum.exitsAsset)}</td><td></td><td></td><td></td>
@@ -2512,7 +2514,7 @@ function tradeHoverDetail(t){
   /* Zat er meer achter deze positie dan een keer in en een keer uit? Zeg dat hier, en
      wijs naar Review - daar staat de hele stappentabel. Zonder deze regel zou niemand
      weten dat die bestaat. */
-  const st=stepsOf(t);const sm=st.length>=2?fillSummary(st):null;
+  const st=stappenVan(t);const sm=st.length>=2?fillSummary(st):null;
   if(sm&&(sm.entries>1||sm.exits>1)){
     tl+=`<div class="tline" style="margin-top:6px"><span class="tlc">\u21C5 ${sm.entries} ${sm.entries===1?'instap':'instappen'} \u00b7 ${sm.exits} ${sm.exits===1?'afbouw':'afbouwstappen'}</span>`
       +`<span class="tla">\u2192</span><span class="tlc" style="color:var(--muted)">elke stap staat in Review</span></div>`;
@@ -2654,7 +2656,9 @@ function fxView(list){
   return list.map(t=>{
     // de koers van de handelsdag; die ligt vast zodra de ECB hem publiceert
     const r=(+t.fx)||fxFor(t.date)||FX.latest; if(!(r>0))return t;
-    const o={...t,pnlUsd:+t.pnl||0};   // percentages blijven in dollars rekenen
+    /* pnlUsd: percentages blijven in dollars rekenen. _fx: afgeleide stappen leiden hun
+       bedrag af uit de príjzen, en die blijven in de valuta van het paar staan. */
+    const o={...t,pnlUsd:+t.pnl||0,_fx:r};
     FX_MONEY.forEach(k=>{const v=+o[k];if(isFinite(v))o[k]=v*r;});
     // de losse stappen horen in dezelfde valuta te staan als het totaal erboven
     if(Array.isArray(t.fills)&&t.fills.length)o.fills=t.fills.map(f=>({...f,
@@ -4703,6 +4707,63 @@ function sanitizeTrade(t,i){
 }
 // De stappen van een trade, altijd als schone array — wat er ook in het veld staat.
 const stepsOf=t=>Array.isArray(t&&t.fills)?t.fills.filter(x=>x&&typeof x==='object'):[];
+
+/* Handmatige trades hebben geen opgehaalde stappen, maar je vult genoeg in om ze af te
+   leiden: je stapt in op je entry met je hele positie, neemt bij elke aangevinkte TP dat
+   percentage eraf, en sluit de rest op je exit. Zo krijgt ook een handmatige trade de
+   stappentabel, zonder dat je iets extra hoeft te typen.
+
+   Alleen wanneer er ook echt meer dan één uitstap is — anders vertelt de tabel niets wat
+   niet al boven in het formulier staat. Elke stap draagt `synthetic`, zodat de weergave
+   met een ≈ kan laten zien dat dit afgeleid is en niet van een exchange komt. */
+function afgeleideStappen(t){
+  if(!t||t.status!=='closed')return [];
+  /* Komt de trade van een exchange, dan zijn er échte stappen op te halen. Die willen we,
+     geen reconstructie ernaast - dan zou de ophaalknop ook verdwijnen. */
+  if(isGesynct(t))return [];
+  const entry=+t.entry||0, exit=+t.exit||0;
+  if(!(entry>0)||!(exit>0))return [];
+  const qty=+t.qtyAsset||(+t.size>0?(+t.size)/entry:0);
+  if(!(qty>0))return [];
+  const open=+t.openTime||0, dicht=+t.closeTime||0;
+  if(!(open>0)||!(dicht>open))return [];
+
+  const raak=(t.tps||[]).filter(x=>x&&+x.price>0&&+x.pct>0&&x.hit)
+    .map(x=>({price:+x.price,pct:+x.pct,ts:+x.ts||0}))
+    .sort((a,b)=>(a.ts||0)-(b.ts||0));
+  const gedaan=raak.reduce((a,x)=>a+x.pct,0);
+  const rest=Math.max(0,100-gedaan);
+  const uitstappen=raak.length+(rest>0.01?1:0);
+  if(uitstappen<2)return [];   // één keer uit is geen verhaal
+
+  const lang=String(t.dir||'').toLowerCase()!=='short';
+  const feeTotaal=Math.abs(+t.fees||0);
+  const stappen=[{ts:open,side:lang?'buy':'sell',qty,price:entry,fee:0,synthetic:true,id:'a0'}];
+  raak.forEach((x,i)=>{
+    // geen tijd ingevuld? verdeel de afbouw netjes tussen open en sluiting
+    const ts=x.ts>open&&x.ts<=dicht?x.ts:open+Math.round((dicht-open)*((i+1)/(uitstappen+1)));
+    stappen.push({ts,side:lang?'sell':'buy',qty:qty*x.pct/100,price:x.price,fee:0,synthetic:true,id:'a'+(i+1)});
+  });
+  if(rest>0.01)stappen.push({ts:dicht,side:lang?'sell':'buy',qty:qty*rest/100,price:exit,fee:0,synthetic:true,id:'a'+(raak.length+1)});
+  // de fees kent de app alleen als totaal; naar rato verdelen is het eerlijkste dat kan
+  const som=stappen.reduce((a,x)=>a+x.qty,0);
+  if(feeTotaal>0&&som>0)stappen.forEach(x=>{x.fee=feeTotaal*x.qty/som;});
+  return stappen;
+}
+/* De stappen zoals de weergave ze wil zien: opgehaald wanneer die er zijn, anders afgeleid. */
+function stappenVan(t){
+  const echt=stepsOf(t);
+  if(echt.length)return echt;
+  const af=afgeleideStappen(t);
+  if(!af.length)return [];
+  const tl=fillTimeline(af,{mult:1});
+  /* De bedragen per stap volgen uit de príjzen, en die staan in de valuta van het paar -
+     ook wanneer je de journal in euro's bekijkt. De fees komen al omgerekend binnen (van
+     de trade zelf), dus alleen de winst en het verlies moeten nog mee. */
+  const r=+t._fx;
+  if(r>0&&r!==1)tl.forEach(x=>{ if(x.pnl!=null)x.pnl*=r; if(x.pnlCalc!=null)x.pnlCalc*=r; });
+  return tl;
+}
 // Datum bruikbaar voor maand-/jaargroepering? (leeg of half ingevuld telt niet mee)
 const hasDate=t=>!!(t&&typeof t.date==='string'&&t.date.length>=7);
 function applyBackup(d){
@@ -7595,11 +7656,19 @@ function renderTPs(){const c=document.getElementById('tpbuilder');if(!c)return;
 function tpStats(t){const tps=(t.tps||[]).filter(x=>+x.price>0);if(!tps.length)return null;
   const entry=+t.entry,stop=+t.stop||0,dir=t.dir==='long'?1:-1,risk=Math.abs(entry-stop)||entry*0.01;
   const hit=tps.filter(x=>x.hit),hitPct=hit.reduce((s,x)=>s+(+x.pct||0),0),missedPct=tps.filter(x=>!x.hit).reduce((s,x)=>s+(+x.pct||0),0),denom=hitPct+missedPct;
-  let wExit=null,wR=null;if(denom>0&&stop>0){const hc=hit.reduce((s,x)=>s+(+x.price)*(+x.pct||0),0);wExit=(hc+stop*missedPct)/denom;wR=((wExit-entry)*dir)/risk;}
-  return {tps,hit,hitPct,missedPct,wExit,wR};}
+  /* Het deel dat zijn TP niet haalde is bij een gesloten trade op je exit gegaan, niet op
+     je stop. Dat laatste is alleen een redelijke aanname zolang de positie nog loopt.
+     Zonder dit meldde een trade die op +1,48R sloot "gerealiseerd +0,0R". (Denny 23-09-2026.) */
+  const dicht=t.status==='closed'&&+t.exit>0;
+  const rest=dicht?+t.exit:stop;
+  let wExit=null,wR=null;
+  if(denom>0&&rest>0){const hc=hit.reduce((s,x)=>s+(+x.price)*(+x.pct||0),0);wExit=(hc+rest*missedPct)/denom;
+    if(stop>0)wR=((wExit-entry)*dir)/risk;}   // R heeft een echte stop nodig, anders is het geen risico
+  return {tps,hit,hitPct,missedPct,wExit,wR,dicht};}
 function tpBreakdown(t){const s=tpStats(t);if(!s)return '<div style="color:var(--muted);font-size:12.5px;padding:6px 0">Geen TP-niveaus vastgelegd.</div>';
   const rows=s.tps.map((tp,i)=>`<div class="tprow ${tp.hit?'hit':''}"><span class="tpdot">${tp.hit?'✓':'○'}</span><span class="tpname">TP${i+1}</span><span class="tpprice num">${(+tp.price).toLocaleString('nl-NL')}</span><span class="tpr num ${(+tp.r||0)>=0?'g':'r'}">${tp.r?('+'+tp.r+'R'):''}</span><div class="tpbar"><div class="tpbarf" style="width:${Math.min(100,+tp.pct||0)}%;background:${tp.hit?'var(--green)':'var(--line2)'}"></div></div><span class="tppct num">${tp.pct}%</span></div>`).join('');
-  const foot=s.wExit!=null?`<div class="tpfoot"><span>Gewogen exit <b class="num">${(+s.wExit).toLocaleString('nl-NL')}</b></span><span class="sp" style="flex:1"></span><span>Hit <b class="num g">${Math.round(s.hitPct)}%</b> · gerealiseerd <b class="num ${cls(s.wR)}">${(s.wR>=0?'+':'')+(+s.wR).toFixed(1)}R</b></span></div>`:'';
+  const rDeel=s.wR!=null?` · ${s.dicht?'gerealiseerd':'bij je stop'} <b class="num ${cls(s.wR)}">${(s.wR>=0?'+':'')+(+s.wR).toFixed(1)}R</b>`:'';
+  const foot=s.wExit!=null?`<div class="tpfoot"><span>Gewogen exit <b class="num">${(+s.wExit).toLocaleString('nl-NL')}</b>${s.dicht?'':' <span title="De positie loopt nog; het niet-gehaalde deel is afgerekend op je stop">(aanname)</span>'}</span><span class="sp" style="flex:1"></span><span>Hit <b class="num g">${Math.round(s.hitPct)}%</b>${rDeel}</span></div>`:'';
   return `<div class="tplist">${rows}</div>${foot}`;}
 function fnum(id){const el=document.getElementById(id);if(!el)return NaN;const v=parseFloat(String(el.value).trim().replace(',','.'));return isNaN(v)?NaN:v;}
 // ── Positie-grootte in $ óf in de asset zelf (bv. 0,5 BTC) — omrekening via entry ──
