@@ -7196,7 +7196,8 @@ const ExchangeAPI = {
          position; keep the one with the earliest start, which holds all the steps. */
       const pos={};
       T.forEach(t=>{if(t&&t.exchange==="kraken"&&/^kraken_pos_/.test(String(t.srcId||""))&&t.closeTime){const k=t.positionId+"|"+t.closeTime;(pos[k]=pos[k]||[]).push(t);}});
-      Object.values(pos).forEach(g=>{if(g.length<2)return;g.sort((a,b)=>this._msTijd(a.openTime)-this._msTijd(b.openTime));
+      const uitLog=t=>this._log&&this._log.levenslopen.some(L=>String(L.id)===String(t.srcId))?0:1;   // the account-log row always wins
+      Object.values(pos).forEach(g=>{if(g.length<2)return;g.sort((a,b)=>(uitLog(a)-uitLog(b))||(this._msTijd(a.openTime)-this._msTijd(b.openTime)));
         g.slice(1).forEach(o=>{this._voegSamen(g[0],o);n++;});});
       /* Account-log (v1.10): rows the events path made (other id, sometimes cut off or glued together)
          merge into the lifecycle their opening falls in: same pair, direction and contract, the closest
@@ -7205,10 +7206,13 @@ const ExchangeAPI = {
         const nieuwId=new Set(this._log.levenslopen.map(t=>String(t.id)));
         T.filter(o=>o&&o.exchange==="kraken"&&/^kraken_pos_/.test(String(o.srcId||""))&&!nieuwId.has(String(o.srcId))).forEach(o=>{
           const t0=this._msTijd(o.openTime);if(!t0)return;
-          const kand=this._log.levenslopen.filter(L=>L.pair===o.pair&&this._dirVan(L)===this._dirVan(o)&&this._zelfdeContract(L,o)&&t0>=+L.openTime-90e3&&t0<=+L.closeTime);
+          // direction is a preference, not a requirement: the events path often took it from the closing step
+          const kand=this._log.levenslopen.filter(L=>L.pair===o.pair&&this._zelfdeContract(L,o)&&t0>=+L.openTime-90e3&&t0<=+L.closeTime);
           if(!kand.length)return;
-          const L=kand.sort((a,b)=>Math.abs(+a.openTime-t0)-Math.abs(+b.openTime-t0))[0];
-          if(this._log.weg.has(String(L.id))){trashDelete([o.id]);n++;return;}
+          const zelfde=L=>this._dirVan(L)===this._dirVan(o)?0:1;
+          const L=kand.sort((a,b)=>(zelfde(a)-zelfde(b))||(Math.abs(+a.openTime-t0)-Math.abs(+b.openTime-t0)))[0];
+          // thrown away, or closed before the start date you chose: the old row does not belong in the journal (trash, recoverable)
+          if(this._log.weg.has(String(L.id))||(this._log.startDatum&&+L.closeTime<this._log.startDatum)){trashDelete([o.id]);n++;return;}
           const doel=T.find(x=>x&&x.exchange==="kraken"&&String(x.srcId)===String(L.id));
           if(doel){this._voegSamen(doel,o);n++;}
         });
@@ -7284,7 +7288,11 @@ const ExchangeAPI = {
          where a capped run stopped; after that the window since the last sync, widened to the start of
          any running position so its opening is always inside. */
       const lopendeStart=T.filter(t=>t&&t.exchange==="kraken"&&(t.status==="open"||t.status==="partial")).map(t=>this._msTijd(t.openTime)).filter(Boolean);
-      let vanaf=c.log?(+startTime||0):(+c.logTot||(c.syncFrom?+new Date(c.syncFrom):0));
+      const startDatum=c.syncFrom?+new Date(c.syncFrom):0;
+      let vanaf=c.log?(+startTime||0):(+c.logTot||startDatum);
+      // the one-time cleanup reaches back to the oldest existing Kraken row; imports still start at the start date
+      const oudsteRij=T.filter(t=>t&&t.exchange==="kraken"&&/^kraken_pos_/.test(String(t.srcId||""))).map(t=>this._msTijd(t.openTime)).filter(Boolean);
+      if(!c.log&&!c.logTot&&vanaf>0&&oudsteRij.length)vanaf=Math.min(vanaf,Math.min(...oudsteRij)-60e3);
       if(c.log&&vanaf>0&&lopendeStart.length)vanaf=Math.min(vanaf,Math.min(...lopendeStart)-1000);
       const log=await this._logOphalen(apiKey,apiSecret,vanaf);
       if(log){
@@ -7300,11 +7308,11 @@ const ExchangeAPI = {
         });
         this._bewaarWeg(weg);
         const levenslopen=uit.trades.filter(t=>!this._isWees(t));
-        this._log={levenslopen,weg,afgekapt:log.afgekapt};
+        this._log={levenslopen,weg,afgekapt:log.afgekapt,startDatum};
         if(log.afgekapt){CONNS.kraken={...CONNS.kraken,logTot:log.tot};persistConns();}
         else if(!c.log){const n={...CONNS.kraken,log:1};delete n.logTot;CONNS.kraken=n;persistConns();}
         if(uit.waarschuwingen.length)console.warn('[kraken account-log] '+uit.waarschuwingen.length+' row(s) not closing:',uit.waarschuwingen);
-        return levenslopen.filter(t=>!weg.has(String(t.id)));
+        return levenslopen.filter(t=>!weg.has(String(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
       }
       if(T.some(t=>this._zoektTijd(t)))startTime=Math.min(+startTime||Date.now(),Date.now()-this._OPEN_TERUG_MS);
       const data=await proxyCall({exchange:"kraken",action:"trades",apiKey,apiSecret,startTime,withEvents:true});   // de oude journal vraagt er niet om, en krijgt ze dus ook niet
