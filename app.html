@@ -7283,12 +7283,14 @@ const ExchangeAPI = {
     _zoektTijd(t){return !!t&&t.exchange==="kraken"&&(t.status==="open"||t.status==="partial")&&!t._stale&&!t._krZocht&&!this._msTijd(t.openTime);},
     async fetchTrades(apiKey,apiSecret,_pp,startTime){
       this._lopend={};this._log=null;
-      const c=CONNS.kraken||{};
+      let c=CONNS.kraken||{};
       /* First time via the account-log: the whole history (or from the configured start date), continuing
          where a capped run stopped; after that the window since the last sync, widened to the start of
          any running position so its opening is always inside. */
       const lopendeStart=T.filter(t=>t&&t.exchange==="kraken"&&(t.status==="open"||t.status==="partial")).map(t=>this._msTijd(t.openTime)).filter(Boolean);
       const startDatum=c.syncFrom?+new Date(c.syncFrom):0;
+      // start date moved earlier than the history fetched so far (logVanaf): fetch the missing part once, like a first sync
+      if(c.log&&!(c.logVanaf!=null&&+c.logVanaf<=startDatum)){c={...c,log:0};delete c.logTot;CONNS.kraken=c;persistConns();}
       let vanaf=c.log?(+startTime||0):(+c.logTot||startDatum);
       // the one-time cleanup reaches back to the oldest existing Kraken row; imports still start at the start date
       const oudsteRij=T.filter(t=>t&&t.exchange==="kraken"&&/^kraken_pos_/.test(String(t.srcId||""))).map(t=>this._msTijd(t.openTime)).filter(Boolean);
@@ -7310,7 +7312,7 @@ const ExchangeAPI = {
         const levenslopen=uit.trades.filter(t=>!this._isWees(t));
         this._log={levenslopen,weg,afgekapt:log.afgekapt,startDatum};
         if(log.afgekapt){CONNS.kraken={...CONNS.kraken,logTot:log.tot};persistConns();}
-        else if(!c.log){const n={...CONNS.kraken,log:1};delete n.logTot;CONNS.kraken=n;persistConns();}
+        else if(!c.log){const n={...CONNS.kraken,log:1,logVanaf:startDatum};delete n.logTot;CONNS.kraken=n;persistConns();}
         if(uit.waarschuwingen.length)console.warn('[kraken account-log] '+uit.waarschuwingen.length+' row(s) not closing:',uit.waarschuwingen);
         return levenslopen.filter(t=>!weg.has(String(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
       }
