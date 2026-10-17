@@ -7075,7 +7075,7 @@ const ExchangeAPI = {
         const uit=tl.filter(isAfbouw), uitQty=uit.reduce((s,x)=>s+x.qty,0)||1;
         const {date,time}=amsDateTime(L.openTs);
         trades.push({...EMPTY_TRADE,
-          id:"kraken_pos_"+sym+"_"+L.openTs,
+          id:"kraken_pos_"+sym+"_"+Math.floor(L.openTs/1000)*1000,   // whole seconds: the CSV export has seconds, the API milliseconds; same position, same id
           date,time,openTime:String(L.openTs),closeTime:String(L.closeTs),
           pair:this._pair(sym),direction:L.dir,
           entry:sum.avgEntry>0?pxRound(sum.avgEntry):"",
@@ -7236,6 +7236,8 @@ const ExchangeAPI = {
     _LOG_TERUG_MS:30*864e5,   // look-back step while the window starts in the middle of a position
     _LOG_TERUG_MAX:4,         // up to ~4 months; a position cut off beyond that is not imported
     _LOG_EXTRA_MAX:2,         // extra requests when the Worker capped (rate limit: 30 history tokens per request)
+    // While the API is linked the account-log brings everything in; a Kraken CSV import would only add confusion.
+    csvBlokkade(){const c=CONNS.kraken;return(c&&c.connected)?'Kraken is gekoppeld: je trades komen al automatisch binnen via de koppeling (hele historie). Een CSV-import is niet nodig. Wil je toch een CSV importeren, ontkoppel Kraken dan eerst.':'';},
     _isWees(t){return /^⚠ Partial data/.test(String((t&&t.notes)||""));},
     _contractVan(o){if(o&&o.positionId)return String(o.positionId).toUpperCase();const m=/^kraken_pos_(.+)_\d+$/.exec(String((o&&o.srcId)||""));return m?m[1].toUpperCase():"";},
     _zelfdeContract(a,b){const x=this._contractVan(a),y=this._contractVan(b);return !x||!y||x===y;},
@@ -8570,6 +8572,7 @@ function parseExchangeCsvText(text,forExchange){
         }
         // Kraken account log — één levensloop per positie, via de adapter (CSV-import en API-sync delen die functie)
         if(isKrakenLog){
+          const blok=ExchangeAPI.kraken.csvBlokkade();if(blok)throw new Error(blok);
           const rowsRaw=[];
           for(let i=1;i<lines.length;i++){
             const vals=parseCSVLine(lines[i]).map(v=>v.replace(/"/g,""));
