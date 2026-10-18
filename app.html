@@ -9207,7 +9207,14 @@ let formMissed=[];
 function toggleMissed(m){const i=formMissed.indexOf(m);if(i<0)formMissed.push(m);else formMissed.splice(i,1);renderMissed();}
 function renderMissed(){const c=document.getElementById('missedbuilder');if(!c)return;
   c.innerHTML=`<div class="tg-chips pillchips" style="--chip:${tagKleur('missedReasonTags')}">${(tagConfig.missedReasonTags||[]).map(m=>`<span class="tagopt ${formMissed.includes(m)?'on':''}" onclick="toggleMissed('${esc(m).replace(/'/g,'')}')">${esc(m)}</span>`).join('')}</div>`;}
-function onKindChange(){const el=document.getElementById('f_kind'),mf=document.getElementById('missedfield');if(mf)mf.style.display=(el&&el.value==='gemist')?'':'none';if(typeof formExchangeHint==='function')formExchangeHint();}
+function onKindChange(){const el=document.getElementById('f_kind'),mf=document.getElementById('missedfield');if(mf)mf.style.display=(el&&el.value==='gemist')?'':'none';
+  // a backtest or practice trade has no exchange; one you picked yourself stays, and back to Live restores the one before
+  const ex=document.getElementById('f_exchange');
+  if(ex&&el&&!ex.dataset.gekozen){
+    if(el.value!=='live'&&ex.value){ex.dataset.vorige=ex.value;ex.value='';}
+    else if(el.value==='live'&&!ex.value){const eerste=[...ex.options].find(o=>o.value);ex.value=ex.dataset.vorige||(eerste?eerste.value:'');}
+  }
+  if(typeof formExchangeHint==='function')formExchangeHint();}
 function toggleMistake(m){const i=formMistakes.indexOf(m);if(i<0)formMistakes.push(m);else formMistakes.splice(i,1);renderMistakes();}
 function renderMistakes(){const c=document.getElementById('mistakebuilder');if(!c)return;
   c.innerHTML=`<div class="tg-chips pillchips" style="--chip:${tagKleur('mistakeTags')}">${(tagConfig.mistakeTags||[]).map(m=>`<span class="tagopt ${formMistakes.includes(m)?'on':''}" onclick="toggleMistake('${esc(m).replace(/'/g,'')}')">${esc(m)}</span>`).join('')}</div>`;}
@@ -9441,7 +9448,8 @@ function openForm(id){
     // ook een account dat niet (meer) bestaat: anders springt de keuze naar de eerste optie en
     // verhuist de trade bij opslaan stilletjes naar een andere exchange
     if(t.exchange&&!lst.some(([id])=>id===t.exchange))lst.push([t.exchange,EXMAP[t.exchange]?EXMAP[t.exchange].name:t.exchange+' (verwijderd account)']);
-    return lst.map(([id,nm])=>`<option value="${id}" ${t.exchange===id?'selected':''}>${esc(nm)}</option>`).join('');
+    // a backtest or practice trade belongs to no exchange (Denny 18-10-2026); without this the first exchange was picked silently
+    return `<option value="" ${t.exchange?'':'selected'}>Geen exchange (backtest / oefentrade)</option>`+lst.map(([id,nm])=>`<option value="${id}" ${t.exchange===id?'selected':''}>${esc(nm)}</option>`).join('');
   })();
   // Weergave-presets: Standaard/Pro-velden zijn verbergbaar, maar een veld mét inhoud
   // krijgt vf-keep en blijft altijd zichtbaar. Alles blijft in de DOM (submit/calc veilig).
@@ -9451,7 +9459,7 @@ function openForm(id){
     <div class="mhead"><h3>${id!=null?'Trade bewerken':'Nieuwe trade'}</h3><button class="xbtn" onclick="closeForm()">×</button></div>
     <div class="mbody">
       <div class="msub s1"><span class="msn">1</span> Basis</div>
-      <div class="field"><label>Exchange</label><select id="f_exchange" aria-label="Exchange" onchange="formExchangeHint()">${exOpt}</select></div>
+      <div class="field"><label>Exchange</label><select id="f_exchange" aria-label="Exchange" onchange="this.dataset.gekozen=1;formExchangeHint()">${exOpt}</select></div>
       <div class="field full" id="exWarn" hidden></div>
       <div class="field"><label>Pair</label><input id="f_pair" value="${esc(t.pair)}" placeholder="BTC/USDC" oninput="updSzBtn()"></div>
       <div class="field"><label>Datum</label><input type="date" id="f_date" value="${t.date}" onchange="onDateChange()"></div>
