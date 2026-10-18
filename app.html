@@ -7257,7 +7257,7 @@ const ExchangeAPI = {
           const zelfde=L=>this._dirVan(L)===this._dirVan(o)?0:1;
           const L=kand.sort((a,b)=>(zelfde(a)-zelfde(b))||(Math.abs(+a.openTime-t0)-Math.abs(+b.openTime-t0)))[0];
           // thrown away, or closed before the start date you chose: the old row does not belong in the journal (trash, recoverable)
-          if(this._log.weg.has(String(L.id))||(this._log.startDatum&&+L.closeTime<this._log.startDatum)){trashDelete([o.id]);n++;return;}
+          if(this._log.weg.has(this._seconden(L.id))||(this._log.startDatum&&+L.closeTime<this._log.startDatum)){trashDelete([o.id]);n++;return;}
           const doel=T.find(x=>x&&x.exchange==="kraken"&&String(x.srcId)===String(L.id));
           if(doel){this._voegSamen(doel,o);n++;}
         });
@@ -7274,6 +7274,7 @@ const ExchangeAPI = {
         const at=amsDateTime(hit[1].openTime);
         o.openTime=String(hit[1].openTime);o.date=at.date;o.time=at.time;o.session=sessionFromTime(at.time);n++;
       });
+      if(this._log)T.forEach(o=>{if(o&&o.exchange==="kraken"&&o.teruggezet){delete o.teruggezet;n++;}});   // handled: the next sync starts from the last sync again
       this._log=null;   // a CSV import later must not use this sync's lifecycles
       if(n)persist();
       return n;
@@ -7292,7 +7293,9 @@ const ExchangeAPI = {
     _zelfdeContract(a,b){const x=this._contractVan(a),y=this._contractVan(b);return !x||!y||x===y;},
     _dirVan(o){return String((o&&(o.dir||o.direction))||"").toLowerCase();},
     // Trades you threw away stay away, also after the trash is emptied (30 days) or the account is re-linked.
-    _wegIds(){try{return new Set(DB.load('kraken_weg',[])||[]);}catch(e){return new Set();}},
+    // ids made before 17-10 carry the opening in ms, since then in whole seconds: compare on whole seconds
+    _seconden(id){return String(id||"").replace(/^(kraken_pos_.+_)(\d+)$/,(m,a,n)=>a+Math.floor(+n/1000)*1000);},
+    _wegIds(){try{return new Set((DB.load('kraken_weg',[])||[]).map(x=>this._seconden(x)));}catch(e){return new Set();}},
     _bewaarWeg(set){try{DB.save('kraken_weg',[...set]);}catch(e){}},
     /* Merge a superseded row into the row that replaces it without losing anything: notes are joined,
        lists combined, the rest via adoptUserFieldsSJ; the old row goes to the trash (recoverable). */
@@ -7347,6 +7350,9 @@ const ExchangeAPI = {
       const oudsteRij=T.filter(t=>t&&t.exchange==="kraken"&&/^kraken_pos_/.test(String(t.srcId||""))).map(t=>this._msTijd(t.openTime)).filter(Boolean);
       if(!c.log&&!c.logTot&&vanaf>0&&oudsteRij.length)vanaf=Math.min(vanaf,Math.min(...oudsteRij)-60e3);
       if(c.log&&vanaf>0&&lopendeStart.length)vanaf=Math.min(vanaf,Math.min(...lopendeStart)-1000);
+      // a row put back from the trash: fetch the log from its opening, or its position cannot come back
+      const teruggezet=T.filter(t=>t&&t.exchange==="kraken"&&t.teruggezet).map(t=>this._msTijd(t.openTime)||Date.parse(String(t.date||"")+"T"+String(t.time||"00:00")+":00Z")||0).filter(Boolean);
+      if(c.log&&vanaf>0&&teruggezet.length)vanaf=Math.min(vanaf,Math.min(...teruggezet)-60e3);
       const log=await this._logOphalen(apiKey,apiSecret,vanaf);
       if(log){
         const {uit}=log;
@@ -7354,7 +7360,7 @@ const ExchangeAPI = {
         // thrown away stays away: a remembered id, or a trashed trade of the same contract and direction that opened inside this position
         const weg=this._wegIds();
         const prullenbak=TRASH.filter(o=>o&&o.exchange==="kraken");
-        prullenbak.forEach(o=>{if(/^kraken_pos_/.test(String(o.srcId||"")))weg.add(String(o.srcId));});
+        prullenbak.forEach(o=>{if(/^kraken_pos_/.test(String(o.srcId||"")))weg.add(this._seconden(o.srcId));});
         const opent=o=>this._msTijd(o.openTime)||Date.parse(String(o.date||"")+"T"+String(o.time||"00:00")+":00Z")||0;
         uit.trades.forEach(t=>{
           if(prullenbak.some(o=>o.pair===t.pair&&this._dirVan(o)===this._dirVan(t)&&this._zelfdeContract(o,t)&&opent(o)>=+t.openTime-90e3&&opent(o)<+t.closeTime))weg.add(String(t.id));
@@ -7362,16 +7368,21 @@ const ExchangeAPI = {
         /* ... unless it is still in the journal (a row merged into it sits in the trash, that is no reason), or you
            put a row of it back from the trash: then you want the position back. */
         const levend=T.filter(o=>o&&o.exchange==="kraken");
-        levend.forEach(o=>weg.delete(String(o.srcId)));
+        levend.forEach(o=>weg.delete(this._seconden(o.srcId)));
         const opnieuw=levend.filter(o=>o.teruggezet);
         uit.trades.forEach(t=>{if(opnieuw.some(o=>o.pair===t.pair&&this._dirVan(o)===this._dirVan(t)&&this._zelfdeContract(o,t)&&opent(o)>=+t.openTime-90e3&&opent(o)<+t.closeTime))weg.delete(String(t.id));});
         this._bewaarWeg(weg);
+        // a position already in the journal under its old ms id keeps that id: the row is updated, not replaced by a copy
+        // only a row of the same direction: a broken old-route row can share the id in whole seconds
+        const oudeRijen=levend.filter(o=>/^kraken_pos_/.test(String(o.srcId||"")));
+        uit.trades.forEach(t=>{const o=oudeRijen.find(o=>this._seconden(o.srcId)===String(t.id)&&this._dirVan(o)===this._dirVan(t)&&!o.teruggezet)
+          ||oudeRijen.find(o=>this._seconden(o.srcId)===String(t.id)&&this._dirVan(o)===this._dirVan(t));if(o)t.id=String(o.srcId);});
         const levenslopen=uit.trades.filter(t=>!this._isWees(t));
         this._log={levenslopen,weg,afgekapt:log.afgekapt,startDatum};
         if(log.afgekapt){CONNS.kraken={...CONNS.kraken,logTot:log.tot};persistConns();}
         else if(!c.log){const n={...CONNS.kraken,log:1,logVanaf:startDatum};delete n.logTot;CONNS.kraken=n;persistConns();}
         if(uit.waarschuwingen.length)console.warn('[kraken account-log] '+uit.waarschuwingen.length+' row(s) not closing:',uit.waarschuwingen);
-        const terug=levenslopen.filter(t=>!weg.has(String(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
+        const terug=levenslopen.filter(t=>!weg.has(this._seconden(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
         /* stop-losses for these positions; afterImport writes them (sjFromTj drops unknown fields such as stopBron).
            Once, also for the closed rows imported before the trigger history existed (stopsKlaar). */
         const nu=new Set(terug.map(t=>String(t.id)));
