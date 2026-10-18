@@ -2695,11 +2695,19 @@ function perOrder(fills){
     else uit.push({ordId:x.ordId||'',af,ts:x.ts,qty:x.qty,price:x.price,fills:[x]});});
   return uit;
 }
-/* Label per close (TP level or close order): a stop hit is SL, a close by hand Close, a liquidation Liq; only
-   take-profits are numbered (Denny 18-10-2026: TP1, TP2, SL). Only an exchange that knows sets soort; without
-   it every level stays TP n, as before. */
-const TP_SOORT_LABEL={sl:'SL',hand:'Close',liq:'Liq'};
-function tpLabels(lijst){let n=0;return(lijst||[]).map(x=>TP_SOORT_LABEL[x&&x.soort]||('TP'+(++n)));}
+/* Label per close (TP level or close order), named after what it was (Denny 18-10-2026):
+     a take-profit order, or a close by hand in profit: TP n (by hand: "TP n ✋") - all profit-taking is numbered;
+     a stop order (also at break-even or in profit): SL;  by hand at a loss: "Close ✋";  a liquidation: Liq.
+   Profit = the close price against the average entry, in the trade's direction, fees aside. Only an exchange that
+   knows sets soort; without it every level stays TP n, as before. t: the trade (entry, dir). */
+function tpLabels(lijst,t){
+  const entry=+(t&&t.entry)||0,dir=String(t&&(t.dir||t.direction))==='short'?-1:1;let n=0;
+  return(lijst||[]).map(x=>{const s=x&&x.soort;
+    if(s==='sl')return 'SL';
+    if(s==='liq')return 'Liq';
+    if(s==='hand')return entry>0&&(+x.price-entry)*dir>0?'TP'+(++n)+' ✋':'Close ✋';
+    return 'TP'+(++n);});
+}
 /* De stappen van een positie zijn een verhaal in de tijd: wanneer stapte je in, wanneer
    bouwde je af, en wat leverde dat op. Drie dingen maken dat leesbaar.
 
@@ -2753,7 +2761,7 @@ function execTable(t){
   /* The fills of one order belong together (Denny 18-10-2026): every fill stays visible, a bracket holds
      an order's rows together and its first row says TP n. Only where the exchange gives an order (ordId). */
   const groepen=perOrder(f),metOrder=f.some(x=>x.ordId),haak=new Map();
-  const afLabels=tpLabels(groepen.filter(g=>g.af).map(g=>({soort:g.fills[0].soort})));let afNr=0;
+  const afLabels=tpLabels(groepen.filter(g=>g.af).map(g=>({soort:g.fills[0].soort,price:g.price})),t);let afNr=0;
   if(metOrder)groepen.forEach(g=>{const lbl=g.af?afLabels[afNr++]:'',n=g.fills.length;
     g.fills.forEach((x,i)=>haak.set(x,{cls:n>1?(i===0?'exg exg-s':i===n-1?'exg exg-e':'exg'):'',lbl:i===0?lbl:''}));});
   const nIn=metOrder?groepen.filter(g=>!g.af).length:sum.entries,nUit=metOrder?groepen.filter(g=>g.af).length:sum.exits;
@@ -2843,11 +2851,10 @@ function tradeTimeline(t){
   const fmtMoment=ms=>`${fmtD(ts2date(ms))} ${ts2time(ms)}`;
   const chips=[`<span class="tlc">🚀 Open <b class="num">${fmtMoment(o)}</b></span>`];
   const c=+t.closeTime||0;
-  const hits=(t.tps||[]).filter(x=>x.hit&&+x.ts>0).sort((a,b)=>a.ts-b.ts),lbl=tpLabels(hits);
-  const ICOON={SL:'🛑',Close:'✋',Liq:'⚠️'};
+  const hits=(t.tps||[]).filter(x=>x.hit&&+x.ts>0).sort((a,b)=>a.ts-b.ts),lbl=tpLabels(hits,t);
+  const icoon=l=>l==='SL'?'🛑 ':l==='Liq'?'⚠️ ':/^TP/.test(l)?'🎯 ':'';
   hits.forEach((x,i)=>{
-    if(x.soort==='hand'&&t.status==='closed'&&c&&Math.abs(+x.ts-c)<1000)return;   // the final close by hand is the Close chip below
-    chips.push(`<span class="tlc">${ICOON[lbl[i]]||'🎯'} ${lbl[i]} <b class="num">${ts2date(+x.ts)===ts2date(o)?ts2time(+x.ts):fmtMoment(+x.ts)}</b>${+x.pct?` <span style="color:var(--muted)">(${Math.round(+x.pct)}%)</span>`:''}</span>`);
+    chips.push(`<span class="tlc">${icoon(lbl[i])}${lbl[i]} <b class="num">${ts2date(+x.ts)===ts2date(o)?ts2time(+x.ts):fmtMoment(+x.ts)}</b>${+x.pct?` <span style="color:var(--muted)">(${Math.round(+x.pct)}%)</span>`:''}</span>`);
   });
   if(t.status==='closed'&&c)chips.push(`<span class="tlc">🏁 Close <b class="num">${fmtMoment(c)}</b></span>`);
   const m=tradeDurationMin(t);
@@ -4111,7 +4118,7 @@ function openRevPres(ids,startId,panel){const items=[];
   if(!items.length){toast('Geen trades om te presenteren','info');return;}
   revPres={items,i:Math.max(0,items.findIndex(x=>x.id===startId)),panel:!!panel};drawRevPres();}
 // Take-profit levels with a price, in their own order: TP1, TP2, ... (F1, Denny 14-10-2026).
-const revTps=t=>{const l=(t.tps||[]).filter(x=>x&&+x.price>0),lb=tpLabels(l);return l.map((x,i)=>({n:lb[i],prijs:prijsOfStreep(x.price),pct:+x.pct||0,hit:!!x.hit}));};
+const revTps=t=>{const l=(t.tps||[]).filter(x=>x&&+x.price>0),lb=tpLabels(l,t);return l.map((x,i)=>({n:lb[i],prijs:prijsOfStreep(x.price),pct:+x.pct||0,hit:!!x.hit}));};
 const revTpTxt=x=>x.n+' · '+x.prijs+(x.pct?' · '+x.pct+'%':'')+(x.hit?' ✓':'');
 function revTpBlok(t){const L=revTps(t);return L.length?`<div class="lbl">Take-profits</div><div class="revtps">${L.map(x=>`<span class="${x.hit?'hit':''}">${esc(revTpTxt(x))}</span>`).join('')}</div>`:'';}
 const DC_TP_MAX=4;   // TP rows that fit in the Discord image's info panel; more become "+n"
@@ -9273,7 +9280,7 @@ function tpStats(t){const tps=(t.tps||[]).filter(x=>+x.price>0);if(!tps.length)r
     if(stop>0)wR=((wExit-entry)*dir)/risk;}   // R heeft een echte stop nodig, anders is het geen risico
   return {tps,hit,hitPct,missedPct,wExit,wR,dicht};}
 function tpBreakdown(t){const s=tpStats(t);if(!s)return '<div style="color:var(--muted);font-size:12.5px;padding:6px 0">Geen TP-niveaus vastgelegd.</div>';
-  const lb=tpLabels(s.tps);
+  const lb=tpLabels(s.tps,t);
   const rows=s.tps.map((tp,i)=>`<div class="tprow ${tp.hit?'hit':''}"><span class="tpdot">${tp.hit?'✓':'○'}</span><span class="tpname">${lb[i]}</span><span class="tpprice num">${(+tp.price).toLocaleString('nl-NL')}</span><span class="tpr num ${(+tp.r||0)>=0?'g':'r'}">${tp.r?('+'+tp.r+'R'):''}</span><div class="tpbar"><div class="tpbarf" style="width:${Math.min(100,+tp.pct||0)}%;background:${tp.hit?'var(--green)':'var(--line2)'}"></div></div><span class="tppct num">${tp.pct}%</span>${tp.hit&&+tp.ts?`<span class="tpts num" title="moment waarop dit niveau is gehaald">${ts2date(+tp.ts)===ts2date(+t.openTime||0)?ts2time(+tp.ts):fmtD(ts2date(+tp.ts))+' '+ts2time(+tp.ts)}</span>`:''}</div>`).join('');
   // gesloten: dezelfde (netto) R als overal; nog open: het scenario als de rest op je stop gaat
   const rEcht=s.dicht?tradeROrNull(t):s.wR;
