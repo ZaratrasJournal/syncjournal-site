@@ -762,7 +762,7 @@ table.tbl{width:100%;border-collapse:collapse;font-size:14px}
 .msub.s4{--sec:var(--green)}.msub.s5{--sec:var(--teal)}.msub.s6{--sec:var(--muted)}
 /* hints in formulieren zijn echte instructies → leesbare grijstint, niet de decoratieve */
 .field .hint{font-size:10.5px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
-.fxhint{font-size:11.5px;color:var(--text2);margin-top:4px;font-variant-numeric:tabular-nums}.fxhint:empty{display:none}.fxhint b{color:var(--text)}
+.fxhint{font-size:11.5px;color:var(--ink2);margin-top:4px;font-variant-numeric:tabular-nums}.fxhint:empty{display:none}.fxhint b{color:var(--ink)}
 .tagpick{grid-column:1/-1;display:flex;flex-direction:column;gap:14px}
 .taggroup{display:flex;flex-direction:column;gap:8px}
 .tg-head{display:flex;align-items:center;gap:8px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700}
@@ -2482,6 +2482,12 @@ async function clearAllData(){ if(!confirm('ÁLLE lokale data wissen, trades, ta
 const STATE=Object.assign({page:'dashboard',theme:'light',priv:false,tradeTab:'all',density:'comfy',tend:'sessie',revSel:0,revQuery:'',revFilter:'all',revPeriod:'all',
   sortCol:'date',sortDir:-1,query:'',calMonth:new Date().toISOString().slice(0,7),currency:'USD',selected:[],pbSel:'',pctRef:0,unit:'val',
   sections:{hero:true,kpis:true,equity:true,monthly:true,edge:true,recent:true}}, DB.load('state',{}));
+/* Default currency dollar (v1.11) is for new journals only. A member whose state was never saved with a currency had
+   euros; decide once and save it, so a new journal is not taken for an old one at its next start (review v1.11). */
+if(!('currency' in (DB.load('state',{})||{}))){
+  const bestaand=Object.keys(localStorage).some(k=>(k.startsWith('sj_')&&k!=='sj_state')||k.startsWith('tj_'));
+  STATE.currency=bestaand?'EUR':'USD';persistState();
+}
 STATE.selected=[];
 STATE.revMode='trade'; STATE.revMonth=0; STATE.revShareSel=[]; STATE.shareHide=true;  // review: weergave (trade|beeld), maand-index in Beeld, geselecteerde trade-ids in volgorde, bedragen verbergen in exports
 STATE.tendRow=STATE.tendRow||'setup'; STATE.tendCol=STATE.tendCol||'session';  // Tendencies kruis-heatmap dimensies
@@ -2762,7 +2768,8 @@ function execTable(t){
      an order's rows together and its first row says TP n. Only where the exchange gives an order (ordId). */
   const groepen=perOrder(f),metOrder=f.some(x=>x.ordId),haak=new Map();
   const afLabels=tpLabels(groepen.filter(g=>g.af).map(g=>({soort:g.fills[0].soort,price:g.price})),t);let afNr=0;
-  if(metOrder)groepen.forEach(g=>{const lbl=g.af?afLabels[afNr++]:'',n=g.fills.length;
+  const metSoort=f.some(x=>x.soort);   // without it (OKX, Blofin) a stop or liquidation would read as TP n
+  if(metOrder)groepen.forEach(g=>{const lbl=g.af&&metSoort?afLabels[afNr]:'';if(g.af)afNr++;const n=g.fills.length;
     g.fills.forEach((x,i)=>haak.set(x,{cls:n>1?(i===0?'exg exg-s':i===n-1?'exg exg-e':'exg'):'',lbl:i===0?lbl:''}));});
   const nIn=metOrder?groepen.filter(g=>!g.af).length:sum.entries,nUit=metOrder?groepen.filter(g=>g.af).length:sum.exits;
   const uitv=(n,fills)=>fills>n?` (${fills} uitvoeringen)`:'';
@@ -3060,7 +3067,7 @@ async function fxSync(){
 
 // Trade-bedragen in de weergave-valuta. Geeft KOPIEËN terug: T blijft de dollar-waarheid.
 // Prijzen (entry/exit/stop/tp) blijven onaangeroerd — die staan in USDT en daar denk je in.
-const FX_MONEY=['pnl','fees','realizedPnl','unrealized','mae','mfe'];
+const FX_MONEY=['pnl','fees','realizedPnl','unrealized','unrealizedPnl','mae','mfe'];
 function fxView(list){
   if(dispCur()!=='EUR')return list;
   return list.map(t=>{
@@ -9207,10 +9214,10 @@ let formMissed=[];
 function toggleMissed(m){const i=formMissed.indexOf(m);if(i<0)formMissed.push(m);else formMissed.splice(i,1);renderMissed();}
 function renderMissed(){const c=document.getElementById('missedbuilder');if(!c)return;
   c.innerHTML=`<div class="tg-chips pillchips" style="--chip:${tagKleur('missedReasonTags')}">${(tagConfig.missedReasonTags||[]).map(m=>`<span class="tagopt ${formMissed.includes(m)?'on':''}" onclick="toggleMissed('${esc(m).replace(/'/g,'')}')">${esc(m)}</span>`).join('')}</div>`;}
-function onKindChange(){const el=document.getElementById('f_kind'),mf=document.getElementById('missedfield');if(mf)mf.style.display=(el&&el.value==='gemist')?'':'none';
+function onKindChange(handmatig){const el=document.getElementById('f_kind'),mf=document.getElementById('missedfield');if(mf)mf.style.display=(el&&el.value==='gemist')?'':'none';
   // a backtest or practice trade has no exchange; one you picked yourself stays, and back to Live restores the one before
   const ex=document.getElementById('f_exchange');
-  if(ex&&el&&!ex.dataset.gekozen){
+  if(handmatig&&ex&&el&&!ex.dataset.gekozen){   // only when you change Soort yourself: opening a trade changes nothing
     if(el.value!=='live'&&ex.value){ex.dataset.vorige=ex.value;ex.value='';}
     else if(el.value==='live'&&!ex.value){const eerste=[...ex.options].find(o=>o.value);ex.value=ex.dataset.vorige||(eerste?eerste.value:'');}
   }
@@ -9466,7 +9473,7 @@ function openForm(id){
       <div class="field"><label>Tijd</label><input id="f_time" value="${t.time||''}" placeholder="14:30"></div>
       <div class="field"><label>Richting</label><select id="f_dir" aria-label="Richting" onchange="calcTrade(true)"><option value="long" ${t.dir==='long'?'selected':''}>Long</option><option value="short" ${t.dir==='short'?'selected':''}>Short</option></select></div>
       <div class="field"><label>Status</label><select id="f_status" aria-label="Status"><option value="closed" ${t.status==='closed'?'selected':''}>Gesloten</option><option value="partial" ${t.status==='partial'?'selected':''}>Partial</option><option value="open" ${t.status==='open'?'selected':''}>Open</option></select></div>
-      <div class="field ${vfc('pro',id!=null&&t.kind&&t.kind!=='live')}"><label>Soort <span class="hint">(Live of oefentrade)</span></label><select id="f_kind" aria-label="Soort trade" onchange="onKindChange()">${Object.entries(KINDS).map(([v,k])=>`<option value="${v}" ${(t.kind||'live')===v?'selected':''}>${k.label}</option>`).join('')}</select></div>
+      <div class="field ${vfc('pro',id!=null&&t.kind&&t.kind!=='live')}"><label>Soort <span class="hint">(Live of oefentrade)</span></label><select id="f_kind" aria-label="Soort trade" onchange="onKindChange(true)">${Object.entries(KINDS).map(([v,k])=>`<option value="${v}" ${(t.kind||'live')===v?'selected':''}>${k.label}</option>`).join('')}</select></div>
 
       <div class="msub s2"><span class="msn">2</span> Context</div>
       <div class="field"><label>Sessie</label><select id="f_session" aria-label="Sessie">${opt(SESSIONS,sessionOf(t)||t.session)}</select></div>
