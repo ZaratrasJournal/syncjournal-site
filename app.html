@@ -2245,7 +2245,7 @@ function trashDelete(ids){  // T → TRASH (nieuwste bovenaan)
 function trashRestore(ids){  // TRASH → T; bij id-botsing (nieuwe trade kreeg dat id) een vers id
   const set=new Set(ids),back=[];
   TRASH=TRASH.filter(t=>{ if(set.has(t.id)){back.push(t);return false;} return true; });
-  back.forEach(t=>{ delete t.deletedAt; if(T.some(x=>x.id===t.id))t.id=nextId(); T.push(t); });
+  back.forEach(t=>{ delete t.deletedAt; t.teruggezet=Date.now(); if(T.some(x=>x.id===t.id))t.id=nextId(); T.push(t); });   // teruggezet: adapters that remember thrown-away trades let this one back in
   persist(); persistTrash(); return back.length;
 }
 function purgeTrash(){  // stil bij boot: alles ouder dan 30 dagen definitief weg
@@ -7359,6 +7359,12 @@ const ExchangeAPI = {
         uit.trades.forEach(t=>{
           if(prullenbak.some(o=>o.pair===t.pair&&this._dirVan(o)===this._dirVan(t)&&this._zelfdeContract(o,t)&&opent(o)>=+t.openTime-90e3&&opent(o)<+t.closeTime))weg.add(String(t.id));
         });
+        /* ... unless it is still in the journal (a row merged into it sits in the trash, that is no reason), or you
+           put a row of it back from the trash: then you want the position back. */
+        const levend=T.filter(o=>o&&o.exchange==="kraken");
+        levend.forEach(o=>weg.delete(String(o.srcId)));
+        const opnieuw=levend.filter(o=>o.teruggezet);
+        uit.trades.forEach(t=>{if(opnieuw.some(o=>o.pair===t.pair&&this._dirVan(o)===this._dirVan(t)&&this._zelfdeContract(o,t)&&opent(o)>=+t.openTime-90e3&&opent(o)<+t.closeTime))weg.delete(String(t.id));});
         this._bewaarWeg(weg);
         const levenslopen=uit.trades.filter(t=>!this._isWees(t));
         this._log={levenslopen,weg,afgekapt:log.afgekapt,startDatum};
