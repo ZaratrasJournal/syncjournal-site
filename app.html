@@ -1904,7 +1904,7 @@ const KINDS={live:{label:'Live',color:'var(--green)'},gemist:{label:'Gemist',col
 function isLive(t){return !t.kind||t.kind==='live';}
 
 /* ═══ Persistentie (localStorage) ═══ */
-const APP_VERSION='v1.10';
+const APP_VERSION='v1.11';
 const SCHEMA_VERSION=11;
 const DB={
   // Type-bewust: valt terug op de default als opslag ontbreekt, corrupt is, of van een
@@ -6965,6 +6965,51 @@ const ExchangeAPI = {
       if(met.length>1&&met[0].ts>met[met.length-1].ts)regels.forEach((r,i)=>{r.seq=regels.length-1-i;});
       return regels;
     },
+    /* ═══ Stop-loss from the trigger history (Worker v22, Denny 18-10-2026) ═══ */
+    _STOP_VOOR_MS:60e3,   // a bracket stop may be placed up to 60 s before the opening fill
+    _TRIG_OUD_MS:864e5,   // Worker without 'triggers' (v21): ask again after a day, its fallback is a heavy positions call
+    async _triggersOphalen(apiKey,apiSecret,van,tot){
+      const c=CONNS.kraken||{};if(+c.trigOud>Date.now()-this._TRIG_OUD_MS)return null;
+      try{const d=await proxyCall({exchange:"kraken",action:"triggers",apiKey,apiSecret,startTime:van>0?van:undefined,before:tot});
+        if(!(d&&d.source==="triggers"&&Array.isArray(d.elements))){CONNS.kraken={...CONNS.kraken,trigOud:Date.now()};persistConns();return null;}   // Worker v21 answers with the trades flow
+        if(c.trigOud){const n={...CONNS.kraken};delete n.trigOud;CONNS.kraken=n;persistConns();}
+        return{regels:this._triggerRegels(d.elements),afgekapt:!!(d._trigDebug&&d._trigDebug.afgekapt)};
+      }catch(e){console.warn('[kraken triggers] no stop-losses this sync:',(e&&e.message)||e);return null;}   // the stop is extra: a failing request never blocks the trades
+    },
+    // Trigger events → flat rows. Kraken documents no SL/TP field: side and price decide later.
+    _triggerRegels(elements){
+      const SOORT={OrderTriggerPlaced:'geplaatst',OrderTriggerUpdated:'gewijzigd',OrderTriggerCancelled:'geannuleerd',OrderTriggerActivated:'geactiveerd'};
+      const num=v=>{const n=parseFloat(v);return isFinite(n)?n:0;}, gezien=new Set();
+      return(elements||[]).flatMap(e=>{const k=Object.keys((e&&e.event)||{})[0],soort=SOORT[k];if(!soort)return[];
+        if(e.uid){if(gezien.has(e.uid))return[];gezien.add(e.uid);}   // the same event twice (overlapping pages)
+        const v=e.event[k]||{},o=v.order||v.newOrderTrigger||{},oud=v.oldOrderTrigger;
+        const rij={ts:+e.timestamp||+o.timestamp||0,contract:String(o.tradeable||'').toUpperCase(),side:String(o.direction||'').toLowerCase(),
+          price:num(o.triggerOptions&&o.triggerOptions.triggerPrice),qty:num(o.quantity),soort,uid:String(o.uid||'')};
+        if(soort==='gewijzigd'&&oud){rij.oudePrijs=num(oud.triggerOptions&&oud.triggerOptions.triggerPrice);rij.oudeUid=String(oud.uid||'');}
+        return rij.contract&&rij.price>0?[rij]:[];});
+    },
+    /* The original stop-loss of a position: the first trigger on its contract, closing side, loss side of
+       the entry, placed between the opening (minus a bracket margin) and the close. `verschoven`: that stop
+       order was later edited to another price, or cancelled and replaced by a new stop at entry or worse. */
+    _stopVoorLevensloop(L,regels){
+      const short=String(L.direction||L.dir)==='short',entry=+L.entry,van=+L.openTime-this._STOP_VOOR_MS,tot=+L.closeTime||Infinity;
+      const sluitKant=short?'buy':'sell',verlies=p=>short?p>entry:p<entry,stopKant=p=>short?p>=entry:p<=entry;
+      if(!(entry>0))return{stop:null,verschoven:false};
+      const kand=(regels||[]).filter(r=>r.contract===String(L.positionId||'').toUpperCase()&&r.side===sluitKant&&r.ts>=van&&r.ts<=tot).sort((a,b)=>a.ts-b.ts);
+      const prijsVan=r=>r.soort==='gewijzigd'&&r.oudePrijs>0?r.oudePrijs:r.price;
+      const i=kand.findIndex(r=>(r.soort==='geplaatst'||(r.soort==='gewijzigd'&&r.ts>=+L.openTime))&&verlies(prijsVan(r)));   // an edit inside the bracket margin is the previous position's stop
+      if(i<0)return{stop:null,verschoven:false};
+      const eerste=kand[i],stop=prijsVan(eerste);
+      // follow the stop order itself, so a take-profit placed later never counts as a move
+      let uid=eerste.soort==='gewijzigd'?(eerste.oudeUid||eerste.uid):eerste.uid,nu=stop,weg=false,verschoven=false;
+      const isHet=(u,p)=>uid&&u?u===uid:p===nu;
+      kand.slice(eerste.soort==='gewijzigd'?i:i+1).forEach(r=>{
+        if(r.soort==='gewijzigd'&&isHet(r.oudeUid||r.uid,r.oudePrijs)){if(r.price!==nu)verschoven=true;nu=r.price;uid=r.uid||uid;}
+        else if(r.soort==='geannuleerd'&&!weg&&isHet(r.uid,r.price))weg=true;
+        else if(r.soort==='geplaatst'&&weg&&stopKant(r.price)){if(r.price!==nu)verschoven=true;nu=r.price;uid=r.uid;weg=false;}
+      });
+      return{stop,verschoven};
+    },
     // JSON-regels van /api/history/v3/account-log → dezelfde vorm
     _logRegelsUitJson(logs){
       const num=v=>{const n=parseFloat(v);return isFinite(n)?n:0;};
@@ -7216,6 +7261,10 @@ const ExchangeAPI = {
           const doel=T.find(x=>x&&x.exchange==="kraken"&&String(x.srcId)===String(L.id));
           if(doel){this._voegSamen(doel,o);n++;}
         });
+        // stop-loss from the trigger history: fill an empty stop or one Kraken set before; a stop the user typed or cleared stays
+        if(this._log.stops)T.forEach(o=>{if(!o||o.exchange!=="kraken")return;const s=this._log.stops.get(String(o.srcId));if(!s)return;
+          if(o.stopBron==='gebruiker'||(+o.stop>0&&o.stopBron!=='kraken'))return;
+          if(+o.stop!==s.stop||o.stopBron!=='kraken'||!!o.stopVerschoven!==s.verschoven){o.stop=s.stop;o.stopBron='kraken';if(s.verschoven)o.stopVerschoven=true;else delete o.stopVerschoven;n++;}});
       }
       const lop=this._lopend||{};
       T.forEach(o=>{
@@ -7316,7 +7365,20 @@ const ExchangeAPI = {
         if(log.afgekapt){CONNS.kraken={...CONNS.kraken,logTot:log.tot};persistConns();}
         else if(!c.log){const n={...CONNS.kraken,log:1,logVanaf:startDatum};delete n.logTot;CONNS.kraken=n;persistConns();}
         if(uit.waarschuwingen.length)console.warn('[kraken account-log] '+uit.waarschuwingen.length+' row(s) not closing:',uit.waarschuwingen);
-        return levenslopen.filter(t=>!weg.has(String(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
+        const terug=levenslopen.filter(t=>!weg.has(String(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
+        /* stop-losses for these positions; afterImport writes them (sjFromTj drops unknown fields such as stopBron).
+           Once, also for the closed rows imported before the trigger history existed (stopsKlaar). */
+        const nu=new Set(terug.map(t=>String(t.id)));
+        const eerder=(CONNS.kraken||{}).stopsKlaar?[]:T.filter(o=>o&&o.exchange==="kraken"&&o.status==="closed"&&/^kraken_pos_/.test(String(o.srcId||""))&&!nu.has(String(o.srcId))&&+o.openTime>0&&+o.closeTime>0)
+          .map(o=>({id:o.srcId,positionId:o.positionId,direction:o.dir,entry:o.entry,openTime:o.openTime,closeTime:o.closeTime}));
+        const doelen=terug.concat(eerder);
+        if(doelen.length){
+          const van=Math.min(...doelen.map(t=>+t.openTime))-this._STOP_VOOR_MS, tot=Math.max(...doelen.map(t=>+t.closeTime))+1;
+          const res=await this._triggersOphalen(apiKey,apiSecret,van,tot);
+          if(res){const stops=new Map();doelen.forEach(t=>{const s=this._stopVoorLevensloop(t,res.regels);if(s.stop)stops.set(String(t.id),s);});this._log.stops=stops;
+            if(!res.afgekapt&&!(CONNS.kraken||{}).stopsKlaar){CONNS.kraken={...CONNS.kraken,stopsKlaar:1};persistConns();}}
+        }
+        return terug;
       }
       if(T.some(t=>this._zoektTijd(t)))startTime=Math.min(+startTime||Date.now(),Date.now()-this._OPEN_TERUG_MS);
       const data=await proxyCall({exchange:"kraken",action:"trades",apiKey,apiSecret,startTime,withEvents:true});   // de oude journal vraagt er niet om, en krijgt ze dus ook niet
@@ -9284,7 +9346,7 @@ function openForm(id){
       ${formLocked?`<div class="field full"><div class="lockbar">\ud83d\udd12 Entry, exit, size, fees en P&amp;L komen van ${esc((EXMAP[t.exchange]||{}).name||'de exchange')} en zijn hier niet aan te passen. Stop, risico en alles wat over jou gaat wel.</div></div>`:''}
       <div class="field"><label>Entry</label><input id="f_entry"${RO} value="${t.entry}" inputmode="decimal" oninput="calcTrade(true)"></div>
       <div class="field"><label>Exit</label><input id="f_exit"${RO} value="${t.exit}" inputmode="decimal" oninput="calcTrade(true)"></div>
-      <div class="field ${vfc('std',+t.stop>0)}"><label>Stop-loss</label><input id="f_stop" value="${t.stop||''}" inputmode="decimal" oninput="calcTrade(true)"></div>
+      <div class="field ${vfc('std',+t.stop>0)}"><label>Stop-loss${t.stopBron&&t.stopBron!=='gebruiker'&&EXMAP[t.stopBron]?` <span class="hint">(van ${esc(EXMAP[t.stopBron].name)}${t.stopVerschoven?', later verschoven':''})</span>`:''}</label><input id="f_stop" value="${t.stop||''}" inputmode="decimal" oninput="calcTrade(true)"></div>
       <div class="field"><label>Size <span class="hint">(in ${CURSYM()} of in de asset)</span></label>
         <div class="szrow"><input id="f_size"${RO} value="${formSizeUnit==='asset'?(t.qty||''):t.size}" inputmode="decimal" oninput="calcTrade(true)">
         <div class="szseg" id="szseg"><button type="button" class="${formSizeUnit==='usd'?'on':''}" onclick="setSizeUnit('usd')">${CURSYM()}</button><button type="button" id="szAssetBtn" class="${formSizeUnit==='asset'?'on':''}" onclick="setSizeUnit('asset')">${esc(pairBase(t.pair)||'coin')}</button></div></div></div>
@@ -9421,7 +9483,9 @@ function submitForm(id){
     const oud=T.find(x=>x.id===id)||{};
     ['entry','exit','size','sizeUnit','qty','pnl','fees','tps'].forEach(k=>{ if(k in oud)obj[k]=oud[k]; else delete obj[k]; });
   }
-  if(id!=null&&id!=='null'){const t=T.find(x=>x.id===id);const oldO=+t.openTime||0,oldC=+t.closeTime||0;Object.assign(t,obj);
+  if(id!=null&&id!=='null'){const t=T.find(x=>x.id===id);const oldO=+t.openTime||0,oldC=+t.closeTime||0;
+    if((+t.stop||0)!==(+obj.stop||0)){t.stopBron='gebruiker';delete t.stopVerschoven;}   // changed or cleared by hand: a sync must leave it alone
+    Object.assign(t,obj);
     // seconde-precisie van gesyncte timestamps behouden als de minuut niet is gewijzigd
     if(oldO&&Math.floor(oldO/60000)===Math.floor((+t.openTime||0)/60000))t.openTime=String(oldO);
     if(oldC&&Math.floor(oldC/60000)===Math.floor((+t.closeTime||0)/60000))t.closeTime=String(oldC);}
