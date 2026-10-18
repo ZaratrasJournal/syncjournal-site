@@ -1649,7 +1649,8 @@ function _pctBases(){
   if(key===_pctKey&&_pctMap)return _pctMap;
   const m=new Map();
   // Everything booked, partials too: the balance already holds a TP that was hit (v1.5).
-  const geld=T.filter(t=>t&&(t.status==='closed'||t.status==='partial')).sort((a,b)=>tradeMoment(a)-tradeMoment(b));
+  // Only live trades: a backtest or a missed trade is no money in the account (Denny 18-10: −107%, 2834%).
+  const geld=T.filter(t=>t&&isLive(t)&&(t.status==='closed'||t.status==='partial')).sort((a,b)=>tradeMoment(a)-tradeMoment(b));
   let acc=0;
   for(let i=geld.length-1;i>=0;i--){acc+=geboekt(geld[i]);m.set(geld[i].id,total-acc);}
   _pctKey=key;_pctMap=m;return m;
@@ -1668,7 +1669,7 @@ function pnlPctOf(t){if(!t)return null;const b=pnlBaseOf(t);return b>0?+((pnlUsd
 // Totaal-regel: netto van de selectie t.o.v. de basis van de oudste trade erin.
 function pnlPctTotal(rows,net){
   // Everything booked; a partial counts with its booked part when it arrives via boeking().
-  const geld=(rows||[]).filter(t=>t&&(t.status==='closed'||t.status==='partial'));
+  const geld=(rows||[]).filter(t=>t&&isLive(t)&&(t.status==='closed'||t.status==='partial'));
   const n=geld.length?netUsd(geld):(+net||0);   // altijd in dollars, ongeacht de weergave
   const ref=+((STATE||{}).pctRef)||0;if(ref>0)return +(n/ref*100).toFixed(2);
   if(!geld.length)return null;
@@ -7388,7 +7389,12 @@ const ExchangeAPI = {
         const nu=new Set(terug.map(t=>String(t.id)));
         const eerder=(CONNS.kraken||{}).stopsKlaar?[]:T.filter(o=>o&&o.exchange==="kraken"&&o.status==="closed"&&/^kraken_pos_/.test(String(o.srcId||""))&&!nu.has(String(o.srcId))&&+o.openTime>0&&+o.closeTime>0)
           .map(o=>({id:o.srcId,positionId:o.positionId,direction:o.dir,entry:o.entry,openTime:o.openTime,closeTime:o.closeTime}));
-        const doelen=terug.concat(eerder);
+        // running positions: the opening from the account-log (_lopend), the window up to now (F4)
+        const nuMs=Date.now();
+        const lopend=T.filter(o=>o&&o.exchange==="kraken"&&o.status==="open").map(o=>{
+          const hit=Object.entries(this._lopend).find(([sym,l])=>this._pair(sym)===o.pair&&l.dir===o.dir);
+          return hit&&+hit[1].openTime>0?{id:String(o.srcId),positionId:hit[0],direction:o.dir,entry:o.entry,openTime:String(hit[1].openTime),closeTime:String(nuMs)}:null;}).filter(Boolean);
+        const doelen=terug.concat(eerder,lopend);
         if(doelen.length){
           const van=Math.min(...doelen.map(t=>+t.openTime))-this._STOP_VOOR_MS, tot=Math.max(...doelen.map(t=>+t.closeTime))+1;
           const res=await this._triggersOphalen(apiKey,apiSecret,van,tot);
