@@ -2695,6 +2695,11 @@ function perOrder(fills){
     else uit.push({ordId:x.ordId||'',af,ts:x.ts,qty:x.qty,price:x.price,fills:[x]});});
   return uit;
 }
+/* Label per close (TP level or close order): a stop hit is SL, a close by hand Close, a liquidation Liq; only
+   take-profits are numbered (Denny 18-10-2026: TP1, TP2, SL). Only an exchange that knows sets soort; without
+   it every level stays TP n, as before. */
+const TP_SOORT_LABEL={sl:'SL',hand:'Close',liq:'Liq'};
+function tpLabels(lijst){let n=0;return(lijst||[]).map(x=>TP_SOORT_LABEL[x&&x.soort]||('TP'+(++n)));}
 /* De stappen van een positie zijn een verhaal in de tijd: wanneer stapte je in, wanneer
    bouwde je af, en wat leverde dat op. Drie dingen maken dat leesbaar.
 
@@ -2748,8 +2753,8 @@ function execTable(t){
   /* The fills of one order belong together (Denny 18-10-2026): every fill stays visible, a bracket holds
      an order's rows together and its first row says TP n. Only where the exchange gives an order (ordId). */
   const groepen=perOrder(f),metOrder=f.some(x=>x.ordId),haak=new Map();
-  let tpNr=0;
-  if(metOrder)groepen.forEach(g=>{const lbl=g.af?'TP'+(++tpNr):'',n=g.fills.length;
+  const afLabels=tpLabels(groepen.filter(g=>g.af).map(g=>({soort:g.fills[0].soort})));let afNr=0;
+  if(metOrder)groepen.forEach(g=>{const lbl=g.af?afLabels[afNr++]:'',n=g.fills.length;
     g.fills.forEach((x,i)=>haak.set(x,{cls:n>1?(i===0?'exg exg-s':i===n-1?'exg exg-e':'exg'):'',lbl:i===0?lbl:''}));});
   const nIn=metOrder?groepen.filter(g=>!g.af).length:sum.entries,nUit=metOrder?groepen.filter(g=>g.af).length:sum.exits;
   const uitv=(n,fills)=>fills>n?` (${fills} uitvoeringen)`:'';
@@ -2837,10 +2842,13 @@ function tradeTimeline(t){
   const o=+t.openTime||0;if(!o)return '';
   const fmtMoment=ms=>`${fmtD(ts2date(ms))} ${ts2time(ms)}`;
   const chips=[`<span class="tlc">🚀 Open <b class="num">${fmtMoment(o)}</b></span>`];
-  (t.tps||[]).filter(x=>x.hit&&+x.ts>0).sort((a,b)=>a.ts-b.ts).forEach((x,i)=>{
-    chips.push(`<span class="tlc">🎯 TP${i+1} <b class="num">${ts2date(+x.ts)===ts2date(o)?ts2time(+x.ts):fmtMoment(+x.ts)}</b>${+x.pct?` <span style="color:var(--muted)">(${Math.round(+x.pct)}%)</span>`:''}</span>`);
-  });
   const c=+t.closeTime||0;
+  const hits=(t.tps||[]).filter(x=>x.hit&&+x.ts>0).sort((a,b)=>a.ts-b.ts),lbl=tpLabels(hits);
+  const ICOON={SL:'🛑',Close:'✋',Liq:'⚠️'};
+  hits.forEach((x,i)=>{
+    if(x.soort==='hand'&&t.status==='closed'&&c&&Math.abs(+x.ts-c)<1000)return;   // the final close by hand is the Close chip below
+    chips.push(`<span class="tlc">${ICOON[lbl[i]]||'🎯'} ${lbl[i]} <b class="num">${ts2date(+x.ts)===ts2date(o)?ts2time(+x.ts):fmtMoment(+x.ts)}</b>${+x.pct?` <span style="color:var(--muted)">(${Math.round(+x.pct)}%)</span>`:''}</span>`);
+  });
   if(t.status==='closed'&&c)chips.push(`<span class="tlc">🏁 Close <b class="num">${fmtMoment(c)}</b></span>`);
   const m=tradeDurationMin(t);
   if(m!=null)chips.push(`<span class="tlc">⏱ <b class="num">${t.status!=='closed'?'~':''}${fmtDurMin(m)}</b>${t.status!=='closed'?' <span style="color:var(--amber)">loopt</span>':''}</span>`);
@@ -4103,7 +4111,7 @@ function openRevPres(ids,startId,panel){const items=[];
   if(!items.length){toast('Geen trades om te presenteren','info');return;}
   revPres={items,i:Math.max(0,items.findIndex(x=>x.id===startId)),panel:!!panel};drawRevPres();}
 // Take-profit levels with a price, in their own order: TP1, TP2, ... (F1, Denny 14-10-2026).
-const revTps=t=>(t.tps||[]).filter(x=>x&&+x.price>0).map((x,i)=>({n:'TP'+(i+1),prijs:prijsOfStreep(x.price),pct:+x.pct||0,hit:!!x.hit}));
+const revTps=t=>{const l=(t.tps||[]).filter(x=>x&&+x.price>0),lb=tpLabels(l);return l.map((x,i)=>({n:lb[i],prijs:prijsOfStreep(x.price),pct:+x.pct||0,hit:!!x.hit}));};
 const revTpTxt=x=>x.n+' · '+x.prijs+(x.pct?' · '+x.pct+'%':'')+(x.hit?' ✓':'');
 function revTpBlok(t){const L=revTps(t);return L.length?`<div class="lbl">Take-profits</div><div class="revtps">${L.map(x=>`<span class="${x.hit?'hit':''}">${esc(revTpTxt(x))}</span>`).join('')}</div>`:'';}
 const DC_TP_MAX=4;   // TP rows that fit in the Discord image's info panel; more become "+n"
@@ -6484,7 +6492,7 @@ function fillTimeline(steps,opts){
     return {ts:+f.ts||0,side:f.side,kind,qty:q,qtyAsset:q*mult,price:px,fee,
             posAfter:Math.abs(pos),posAfterAsset:Math.abs(pos)*mult,
             dirAfter:pos>0?'long':pos<0?'short':'',avgEntry:avg,pnl,pnlCalc,
-            ...(f.synthetic?{synthetic:true}:{}),...(f.ordId?{ordId:f.ordId}:{})};
+            ...(f.synthetic?{synthetic:true}:{}),...(f.ordId?{ordId:f.ordId}:{}),...(f.soort?{soort:f.soort}:{})};
   });
 }
 // Samenvatting van een stappenlijst: aantallen en de twee gemiddelden naast elkaar.
@@ -6954,7 +6962,7 @@ const ExchangeAPI = {
       // v12.101: direction-fix — Kraken /openpositions geeft side="long"/"short" (niet "buy"/"sell").
       const sideLc=String(t.side||"").toLowerCase();
       const stableId=t.fill_id||(status==="open"?`open_${t.symbol||"?"}_${ft?ft+"_":""}${sideLc||"?"}`:uid());   // B4: /openpositions sent fillTime 1970 (undocumented field)
-      return{id:"kraken_"+stableId,openTime:t.open_time||ft,closeTime:closeT,date:closeT?closeT.split("T")[0]:(ft?ft.split("T")[0]:""),time:closeT?(closeT.split("T")[1]||"").slice(0,5):(ft?(ft.split("T")[1]||"").slice(0,5):""),pair,direction:t.direction||(sideLc==="buy"||sideLc==="long"?"long":"short"),entry:String(t.entry_price||t.price||""),exit:status==="closed"?String(t.exit_price||""):"",positionSize:usdNotional>0?usdNotional.toFixed(2):String(t.size||""),positionSizeAsset:String(t.size||""),pnl:status==="closed"?pnlVal:"",unrealizedPnl:status==="open"?String(t.unrealized_pnl||""):"",liquidationPrice:String(t.liquidation_price||""),fees:t.fee?String(Math.abs(parseFloat(t.fee)||0).toFixed(4)):"0",leverage:"1",source:"kraken",status,stopLoss:"",takeProfit:"",highestPrice:"",lowestPrice:"",setupTags:[],confirmationTags:[],timeframeTags:[],emotionTags:[],mistakeTags:[],customTags:[],rating:0,screenshot:null,notes:"",links:[],layers:[],manualOverrides:[],tpLevels,originalSizeAsset};
+      return{id:"kraken_"+stableId,openTime:t.open_time||ft,closeTime:closeT,date:closeT?closeT.split("T")[0]:(ft?ft.split("T")[0]:""),time:closeT?(closeT.split("T")[1]||"").slice(0,5):(ft?(ft.split("T")[1]||"").slice(0,5):""),pair,direction:t.direction||(sideLc==="buy"||sideLc==="long"?"long":"short"),entry:String(t.entry_price||t.price||""),exit:status==="closed"?String(t.exit_price||""):"",positionSize:usdNotional>0?usdNotional.toFixed(2):String(t.size||""),positionSizeAsset:String(t.size||""),pnl:status==="closed"?pnlVal:"",unrealizedPnl:status==="open"?String(t.unrealizedPnl??t.unrealized_pnl??""):"",liquidationPrice:String(t.liquidation_price||""),fees:t.fee?String(Math.abs(parseFloat(t.fee)||0).toFixed(4)):"0",leverage:"1",source:"kraken",status,stopLoss:"",takeProfit:"",highestPrice:"",lowestPrice:"",setupTags:[],confirmationTags:[],timeframeTags:[],emotionTags:[],mistakeTags:[],customTags:[],rating:0,screenshot:null,notes:"",links:[],layers:[],manualOverrides:[],tpLevels,originalSizeAsset};
     },
     /* ═══ Account-log → levenslopen (Denny 26-09-2026) ═══
        Kraken's account-log is de bron van waarheid: per uitvoering een positie-regel
@@ -7009,7 +7017,8 @@ const ExchangeAPI = {
         if(e.uid){if(gezien.has(e.uid))return[];gezien.add(e.uid);}   // the same event twice (overlapping pages)
         const v=e.event[k]||{},o=v.order||v.newOrderTrigger||{},oud=v.oldOrderTrigger;
         const rij={ts:+e.timestamp||+o.timestamp||0,contract:String(o.tradeable||'').toUpperCase(),side:String(o.direction||'').toLowerCase(),
-          price:num(o.triggerOptions&&o.triggerOptions.triggerPrice),qty:num(o.quantity),soort,uid:String(o.uid||'')};
+          price:num(o.triggerOptions&&o.triggerOptions.triggerPrice),qty:num(o.quantity),soort,uid:String(o.uid||''),
+          kant:String((o.triggerOptions&&o.triggerOptions.triggerSide)||'').toLowerCase()};
         if(soort==='gewijzigd'&&oud){rij.oudePrijs=num(oud.triggerOptions&&oud.triggerOptions.triggerPrice);rij.oudeUid=String(oud.uid||'');}
         return rij.contract&&rij.price>0?[rij]:[];});
     },
@@ -7034,6 +7043,20 @@ const ExchangeAPI = {
         else if(r.soort==='geplaatst'&&weg&&stopKant(r.price)){if(r.price!==nu)verschoven=true;nu=r.price;uid=r.uid;weg=false;}
       });
       return{stop,verschoven};
+    },
+    /* How a close order went (F5): a trigger activated at the same moment on the closing side is a stop or a TP;
+       triggerSide decides (Kraken docs): closing a long, Below = stop and Above = take-profit, a short the other way
+       round - so a stop moved to break-even or into profit is still a stop. No trigger: closed by hand. */
+    _afbouwSoort(L,regels){
+      const short=String(L.direction||L.dir)==='short',sluitKant=short?'buy':'sell',stopKant=short?'above':'below',entry=+L.entry;
+      const act=(regels||[]).filter(r=>r.soort==='geactiveerd'&&r.contract===String(L.positionId||'').toUpperCase()&&r.side===sluitKant);
+      return g=>{
+        if(g.fills.some(f=>f.kind==='liq'))return 'liq';
+        const a=act.find(r=>Math.floor(r.ts/1000)===Math.floor(g.ts/1000));   // same moment as the execution (seen: to the ms)
+        if(!a)return 'hand';
+        if(a.kant)return a.kant===stopKant?'sl':'tp';
+        return(short?a.price>=entry:a.price<=entry)?'sl':'tp';   // no triggerSide: the side of the entry
+      };
     },
     // JSON-regels van /api/history/v3/account-log → dezelfde vorm
     _logRegelsUitJson(logs,orders){   // orders: Map execution uid → order uid (Worker v23), optional
@@ -7292,9 +7315,11 @@ const ExchangeAPI = {
           const doel=T.find(x=>x&&x.exchange==="kraken"&&String(x.srcId)===String(L.id));
           if(doel){this._voegSamen(doel,o);n++;}
         });
-        // stop-loss from the trigger history: fill an empty stop or one Kraken set before; a stop the user typed or cleared stays
+        // how each close went, on the TP levels (one per close order, same order as the fills)
+        if(this._log.soorten)T.forEach(o=>{if(!o||o.exchange!=="kraken"||!Array.isArray(o.tps))return;const l=this._log.soorten.get(String(o.srcId));if(!l)return;
+          o.tps.forEach((x,i)=>{if(l[i]&&x.soort!==l[i]){x.soort=l[i];n++;}});});
+        // stop-loss from the trigger history: where Kraken knows the stop, it is the stop - like entry and exit (Denny 18-10-2026)
         if(this._log.stops)T.forEach(o=>{if(!o||o.exchange!=="kraken")return;const s=this._log.stops.get(String(o.srcId));if(!s)return;
-          if(o.stopBron==='gebruiker'||(+o.stop>0&&o.stopBron!=='kraken'))return;
           if(+o.stop!==s.stop||o.stopBron!=='kraken'||!!o.stopVerschoven!==s.verschoven){o.stop=s.stop;o.stopBron='kraken';if(s.verschoven)o.stopVerschoven=true;else delete o.stopVerschoven;n++;}});
       }
       const lop=this._lopend||{};
@@ -7336,6 +7361,7 @@ const ExchangeAPI = {
       adoptUserFieldsSJ(doel,o);
       trashDelete([o.id]);
     },
+    _HERHAAL:2,   // history fetched once more per version: 1 = one step per order (v1.11), 2 = how each close went (F5)
     _EXEC_OUD_MS:864e5,   // Worker without 'executions' (v22): ask again after a day, its fallback is a heavy positions call
     // execution uid → order uid (Kraken docs "Get execution events"); null: older Worker or an error, steps then go by the second
     async _ordersOphalen(apiKey,apiSecret,van){
@@ -7392,8 +7418,8 @@ const ExchangeAPI = {
       const startDatum=c.syncFrom?+new Date(c.syncFrom):0;
       // start date moved earlier than the history fetched so far (logVanaf): fetch the missing part once, like a first sync
       if(c.log&&!(c.logVanaf!=null&&+c.logVanaf<=startDatum)){c={...c,log:0};delete c.logTot;CONNS.kraken=c;persistConns();}
-      // once (v1.11): fetch the history again, so trades imported before get one step per order instead of one per execution
-      if(c.log&&!c.stappen){c={...c,log:0};delete c.logTot;CONNS.kraken=c;persistConns();}
+      // once per _HERHAAL version: fetch the history again, so trades imported before get what a newer version adds
+      if(c.log&&(+c.stappen||0)<this._HERHAAL){c={...c,log:0};delete c.logTot;CONNS.kraken=c;persistConns();}
       let vanaf=c.log?(+startTime||0):(+c.logTot||startDatum);
       // the one-time cleanup reaches back to the oldest existing Kraken row; imports still start at the start date
       const oudsteRij=T.filter(t=>t&&t.exchange==="kraken"&&/^kraken_pos_/.test(String(t.srcId||""))).map(t=>this._msTijd(t.openTime)).filter(Boolean);
@@ -7429,7 +7455,7 @@ const ExchangeAPI = {
         const levenslopen=uit.trades.filter(t=>!this._isWees(t));
         this._log={levenslopen,weg,afgekapt:log.afgekapt,startDatum};
         if(log.afgekapt){CONNS.kraken={...CONNS.kraken,logTot:log.tot};persistConns();}
-        else if(!c.log){const n={...CONNS.kraken,log:1,logVanaf:startDatum,stappen:1};delete n.logTot;CONNS.kraken=n;persistConns();}
+        else if(!c.log){const n={...CONNS.kraken,log:1,logVanaf:startDatum,stappen:this._HERHAAL};delete n.logTot;CONNS.kraken=n;persistConns();}
         if(uit.waarschuwingen.length)console.warn('[kraken account-log] '+uit.waarschuwingen.length+' row(s) not closing:',uit.waarschuwingen);
         const terug=levenslopen.filter(t=>!weg.has(this._seconden(t.id))&&(!startDatum||+t.closeTime>=startDatum));   // like the old route: what closed after the start date
         /* stop-losses for these positions; afterImport writes them (sjFromTj drops unknown fields such as stopBron).
@@ -7447,6 +7473,12 @@ const ExchangeAPI = {
           const van=Math.min(...doelen.map(t=>+t.openTime))-this._STOP_VOOR_MS, tot=Math.max(...doelen.map(t=>+t.closeTime))+1;
           const res=await this._triggersOphalen(apiKey,apiSecret,van,tot);
           if(res){const stops=new Map();doelen.forEach(t=>{const s=this._stopVoorLevensloop(t,res.regels);if(s.stop)stops.set(String(t.id),s);});this._log.stops=stops;
+            // how each close went: on the fills (step table); afterImport puts it on the TP levels (sjFromTj drops unknown fields)
+            const soorten=new Map();
+            terug.forEach(t=>{const soort=this._afbouwSoort(t,res.regels);
+              const lijst=perOrder((t.fills||[]).filter(isAfbouw)).map(g=>{const s=soort(g);g.fills.forEach(f=>{f.soort=s;});return s;});
+              soorten.set(String(t.id),lijst);});
+            this._log.soorten=soorten;
             if(!res.afgekapt&&!(CONNS.kraken||{}).stopsKlaar){CONNS.kraken={...CONNS.kraken,stopsKlaar:1};persistConns();}}
         }
         return terug;
@@ -9241,7 +9273,8 @@ function tpStats(t){const tps=(t.tps||[]).filter(x=>+x.price>0);if(!tps.length)r
     if(stop>0)wR=((wExit-entry)*dir)/risk;}   // R heeft een echte stop nodig, anders is het geen risico
   return {tps,hit,hitPct,missedPct,wExit,wR,dicht};}
 function tpBreakdown(t){const s=tpStats(t);if(!s)return '<div style="color:var(--muted);font-size:12.5px;padding:6px 0">Geen TP-niveaus vastgelegd.</div>';
-  const rows=s.tps.map((tp,i)=>`<div class="tprow ${tp.hit?'hit':''}"><span class="tpdot">${tp.hit?'✓':'○'}</span><span class="tpname">TP${i+1}</span><span class="tpprice num">${(+tp.price).toLocaleString('nl-NL')}</span><span class="tpr num ${(+tp.r||0)>=0?'g':'r'}">${tp.r?('+'+tp.r+'R'):''}</span><div class="tpbar"><div class="tpbarf" style="width:${Math.min(100,+tp.pct||0)}%;background:${tp.hit?'var(--green)':'var(--line2)'}"></div></div><span class="tppct num">${tp.pct}%</span>${tp.hit&&+tp.ts?`<span class="tpts num" title="moment waarop dit niveau is gehaald">${ts2date(+tp.ts)===ts2date(+t.openTime||0)?ts2time(+tp.ts):fmtD(ts2date(+tp.ts))+' '+ts2time(+tp.ts)}</span>`:''}</div>`).join('');
+  const lb=tpLabels(s.tps);
+  const rows=s.tps.map((tp,i)=>`<div class="tprow ${tp.hit?'hit':''}"><span class="tpdot">${tp.hit?'✓':'○'}</span><span class="tpname">${lb[i]}</span><span class="tpprice num">${(+tp.price).toLocaleString('nl-NL')}</span><span class="tpr num ${(+tp.r||0)>=0?'g':'r'}">${tp.r?('+'+tp.r+'R'):''}</span><div class="tpbar"><div class="tpbarf" style="width:${Math.min(100,+tp.pct||0)}%;background:${tp.hit?'var(--green)':'var(--line2)'}"></div></div><span class="tppct num">${tp.pct}%</span>${tp.hit&&+tp.ts?`<span class="tpts num" title="moment waarop dit niveau is gehaald">${ts2date(+tp.ts)===ts2date(+t.openTime||0)?ts2time(+tp.ts):fmtD(ts2date(+tp.ts))+' '+ts2time(+tp.ts)}</span>`:''}</div>`).join('');
   // gesloten: dezelfde (netto) R als overal; nog open: het scenario als de rest op je stop gaat
   const rEcht=s.dicht?tradeROrNull(t):s.wR;
   const rDeel=rEcht!=null?` · ${s.dicht?'gerealiseerd':'bij je stop'} <b class="num ${cls(rEcht)}">${rS(rEcht)}</b>`:'';
@@ -9383,6 +9416,7 @@ function openForm(id){
   const t=id!=null?T.find(x=>x.id===id):{date:new Date().toISOString().slice(0,10),time:'',exchange:(MANUAL[0]||relevantExchanges()[0]||{id:'blofin'}).id,pair:'BTC/USDC',dir:'long',setup:'',session:'London',timeframe:'15m',market:'Trending',grade:'',entry:'',stop:'',tp:'',exit:'',size:'',leverage:10,fees:'',risk:'',rrPlanned:'',pnl:'',r:'',status:'closed',emotion:'',mistake:'',emotions:[],mistakes:[],layers:[],tags:[],notes:'',lessons:'',durationMin:'',mae:'',mfe:''};
   formSizeUnit=(t.sizeUnit==='asset'&&t.qty>0)?'asset':'usd';formPbTouched=false;formPbLayersJson='';formCloseAuto={t:'',d:'',s:'',sPrev:'',p:'',e:''};
   formLocked=isGesynct(t);const RO=formLocked?' readonly':'';formFxVast=+t.fx||0;
+  const stopVast=!!(t.stopBron&&t.stopBron!=='gebruiker'&&EXMAP[t.stopBron]);   // the exchange's stop is locked, like entry
   formTags=[...(t.tags||[])];formGrade=gradeOf(t);formShots=[...(t.screenshots||[])];formTvLinks=[...(t.tvLinks||[])];
   formLayers=(t.layers||[]).map(L=>({timeframe:L.timeframe||'',bias:L.bias||'',setups:[...(L.setups||[])],confirmations:[...(L.confirmations||[])]}));
   formEmotions=[...(t.emotions||(t.emotion?[t.emotion]:[]))];
@@ -9427,10 +9461,10 @@ function openForm(id){
         <div class="confseg gradeseg" id="gradeseg">${GRADES.map(g=>`<button data-g="${g.k}" class="g-${g.k} ${formGrade===g.k?'on':''}" onclick="setFormGrade('${g.k}')" title="${g.desc}">${g.k}</button>`).join('')}</div></div>
 
       <div class="msub s3"><span class="msn">3</span> Prijzen &amp; risico</div>
-      ${formLocked?`<div class="field full"><div class="lockbar">\ud83d\udd12 Entry, exit, size, fees en P&amp;L komen van ${esc((EXMAP[t.exchange]||{}).name||'de exchange')} en zijn hier niet aan te passen. Stop, risico en alles wat over jou gaat wel.</div></div>`:''}
+      ${formLocked?`<div class="field full"><div class="lockbar">\ud83d\udd12 Entry, exit, size, fees en P&amp;L komen van ${esc((EXMAP[t.exchange]||{}).name||'de exchange')} en zijn hier niet aan te passen${stopVast?', net als de stop-loss':''}. ${stopVast?'Risico':'Stop, risico'} en alles wat over jou gaat wel.</div></div>`:''}
       <div class="field"><label>Entry</label><input id="f_entry"${RO} value="${t.entry}" inputmode="decimal" oninput="calcTrade(true)"></div>
       <div class="field"><label>Exit</label><input id="f_exit"${RO} value="${t.exit}" inputmode="decimal" oninput="calcTrade(true)"></div>
-      <div class="field ${vfc('std',+t.stop>0)}"><label>Stop-loss${t.stopBron&&t.stopBron!=='gebruiker'&&EXMAP[t.stopBron]?` <span class="hint">(van ${esc(EXMAP[t.stopBron].name)}${t.stopVerschoven?', later verschoven':''})</span>`:''}</label><input id="f_stop" value="${t.stop||''}" inputmode="decimal" oninput="calcTrade(true)"></div>
+      <div class="field ${vfc('std',+t.stop>0)}"><label>Stop-loss${t.stopBron&&t.stopBron!=='gebruiker'&&EXMAP[t.stopBron]?` <span class="hint">(van ${esc(EXMAP[t.stopBron].name)}${t.stopVerschoven?', later verschoven':''})</span>`:''}</label><input id="f_stop"${stopVast?' readonly':''} value="${t.stop||''}" inputmode="decimal" oninput="calcTrade(true)"></div>
       <div class="field"><label>Size <span class="hint">(in $ of in de asset)</span></label>
         <div class="szrow"><input id="f_size"${RO} value="${formSizeUnit==='asset'?(t.qty||''):t.size}" inputmode="decimal" oninput="calcTrade(true)">
         <div class="szseg" id="szseg"><button type="button" class="${formSizeUnit==='usd'?'on':''}" onclick="setSizeUnit('usd')">$</button><button type="button" id="szAssetBtn" class="${formSizeUnit==='asset'?'on':''}" onclick="setSizeUnit('asset')">${esc(pairBase(t.pair)||'coin')}</button></div></div><div class="fxhint" id="fxSize"></div></div>
@@ -9568,7 +9602,8 @@ function submitForm(id){
     ['entry','exit','size','sizeUnit','qty','pnl','fees','tps'].forEach(k=>{ if(k in oud)obj[k]=oud[k]; else delete obj[k]; });
   }
   if(id!=null&&id!=='null'){const t=T.find(x=>x.id===id);const oldO=+t.openTime||0,oldC=+t.closeTime||0;
-    if((+t.stop||0)!==(+obj.stop||0)){t.stopBron='gebruiker';delete t.stopVerschoven;}   // changed or cleared by hand: a sync must leave it alone
+    if(t.stopBron&&t.stopBron!=='gebruiker'&&EXMAP[t.stopBron])obj.stop=t.stop;   // the exchange's stop is locked: readonly is a hint, not a lock
+    else if((+t.stop||0)!==(+obj.stop||0)){t.stopBron='gebruiker';delete t.stopVerschoven;}   // changed or cleared by hand
     Object.assign(t,obj);
     // seconde-precisie van gesyncte timestamps behouden als de minuut niet is gewijzigd
     if(oldO&&Math.floor(oldO/60000)===Math.floor((+t.openTime||0)/60000))t.openTime=String(oldO);
