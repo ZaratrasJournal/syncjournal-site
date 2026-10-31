@@ -115,6 +115,9 @@ h2{font-size:clamp(24px,3.4vw,34px);font-weight:800;line-height:1.15}
 .btn.pri .arr{transition:transform .2s}.btn.pri:hover .arr{transform:translateX(3px)}
 .btn.big{padding:15px 26px;font-size:16px}
 .cta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.cta .demolink{flex-basis:100%;text-align:center;font-size:13px;color:var(--muted);margin-top:4px}
+.cta .demolink a{color:var(--ink2);font-weight:600}
+.cta .demolink a:hover{color:var(--accent)}
 
 /* ═══ 1. Hero ═══ */
 .hero{position:relative;padding:64px 0 40px;overflow:hidden}
@@ -522,7 +525,8 @@ function heroPlay(){
 }
 function ctas(){
   const html=TERUGKEREND
-    ?`<a class="btn pri big" href="${APP}">Open mijn journal <span class="arr">→</span></a><a class="btn" href="${APP}?demo=1">Rondkijken met voorbeelddata</a>`
+    // returning members: sample data replaces their journal, so it is a small link, not a second button
+    ?`<a class="btn pri big" href="${APP}">Open mijn journal <span class="arr">→</span></a><p class="demolink"><a href="${APP}?demo=1">Voorbeelddata bekijken</a> · vervangt je eigen journal</p>`
     :`<a class="btn pri big" href="${APP}?view=${VIEW}">Begin je journal <span class="arr">→</span></a><a class="btn" href="${APP}?demo=1&view=${VIEW}">Rondkijken met voorbeelddata</a>`;
   document.getElementById('heroCta').innerHTML=html;document.getElementById('closeCta').innerHTML=html;
 }
